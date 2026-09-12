@@ -22,6 +22,9 @@ env:
   # Nx Cloud is disabled for this org; without this, nx run-many/build hard-fails with
   # "Nx Cloud: Workspace is unable to be authorized. Exiting run."
   NX_NO_CLOUD: true
+  # Same filename workflows-upstream/build.yml uses for its own archive. Not a coincidence — the
+  # cache-restore step below deliberately targets THAT workflow's cache entry (see comment there).
+  NODE_MODULES_ARCHIVE: node-modules.tar.zst
 
 permissions:
   contents: read
@@ -43,16 +46,27 @@ jobs:
       - name: Start bring-up timer
         run: echo "BRINGUP_START=$(date +%s)" >> "$GITHUB_ENV"
 
-      - name: Yarn install
-        # Retry once, like workflows-upstream/test_playwright.yml: a transient registry/FS hiccup
-        # on a fresh runner is common enough that one retry is worth it before failing the run.
-        run: |
-          yarn install --frozen-lockfile --ignore-scripts\
-            || { echo "::warning::yarn install failed — retry 1"; yarn bootstrap; }
-      - name: Yarn postinstall
-        run: |
-          yarn postinstall.manual \
-            || { echo "::warning::yarn postinstall failed — retry 1"; yarn bootstrap; }
+      - name: Restore node_modules archive
+        id: node-modules-cache
+        uses: actions/cache/restore@v4
+        # Deliberately READ-ONLY (restore, no matching save step): this targets the exact cache key
+        # workflows-upstream/build.yml already writes on every push to develop/stage/master, so a hit
+        # here costs the shared 10 GB per-repo cache budget nothing extra. Key formula copied verbatim
+        # from that workflow so the hash lines up — see its own comments for why a cache MISS is the
+        # safe outcome (falls through to a real bootstrap below) and why this repo does NOT try to
+        # cache the raw ~11 GB node_modules tree directly (it doesn't fit; this compressed archive,
+        # measured there at ~2.9 GB, does). We don't save our own copy: a from-scratch bootstrap here
+        # is rare (most PRs hit build.yml's cache) and a write would risk evicting entries other
+        # workflows in this repo depend on — the exact incident that workflow's comments document.
+        with:
+          path: ${{ env.NODE_MODULES_ARCHIVE }}
+          key: ${{ runner.os }}-${{ runner.arch }}-node-modules-${{ hashFiles('yarn.lock', 'package.json', 'patches/**', '.scripts/postinstall.js') }}
+
+      - name: Restore node_modules
+        shell: bash
+        # Unpacks the archive on a cache hit; bootstraps from scratch (yarn bootstrap:ci, with its
+        # own retry-once) on a miss. Shared script — see .github/scripts/restore-node-modules.sh.
+        run: .github/scripts/restore-node-modules.sh
 
       - name: Build all packages
         # Mandatory before anything serves: the API and Web builds below depend on the compiled
