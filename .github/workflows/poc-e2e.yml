@@ -1,0 +1,153 @@
+name: POC E2E
+
+# Runs the poc-e2e Playwright spike (apps/poc-e2e) on GitHub-hosted ubuntu-latest.
+#
+# Bootstrap/build/serve sequence taken from workflows-upstream/test_playwright.yml (yarn bootstrap ->
+# build:package:all -> build API -> build Web -> serve both -> wait for ready), collapsed into one job
+# since this is a single-spec POC, not the sharded 79-spec gauzy-e2e suite that sequence was built for.
+# Unlike that file, this runner is GitHub-hosted and disposable per run, so there is no self-hosted
+# Node preinstalled (hence actions/setup-node, pinned the same way workflows-upstream/build.yml does)
+# and no port-sharing with other processes (hence API/Web keep their default ports, no :3000->:3001
+# rewrite of the built bundle).
+on:
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: poc-e2e-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  NG_CLI_ANALYTICS: false
+  # Nx Cloud is disabled for this org; without this, nx run-many/build hard-fails with
+  # "Nx Cloud: Workspace is unable to be authorized. Exiting run."
+  NX_NO_CLOUD: true
+
+permissions:
+  contents: read
+
+jobs:
+  e2e:
+    name: poc-e2e
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: Start bring-up timer
+        run: echo "BRINGUP_START=$(date +%s)" >> "$GITHUB_ENV"
+
+      - name: Install & bootstrap dependencies
+        # Retry once, like workflows-upstream/test_playwright.yml: a transient registry/FS hiccup
+        # on a fresh runner is common enough that one retry is worth it before failing the run.
+        run: |
+          yarn bootstrap \
+            || { echo "::warning::yarn bootstrap failed — retry 1"; yarn bootstrap; }
+
+      - name: Build all packages
+        # Mandatory before anything serves: the API and Web builds below depend on the compiled
+        # @gauzy/* packages this produces.
+        run: |
+          yarn build:package:all --parallel=1 \
+            || { echo "::warning::build:package:all failed — retry 1 (nx cache skips built projects)"; yarn build:package:all --parallel=1; }
+        env:
+          NX_ISOLATE_PLUGINS: 'false'
+          NX_DAEMON: 'false'
+
+      - name: Generate dev config
+        # Writes packages/ui-config/src/lib/environments/environment.ts (gitignored), which the web
+        # bundle compiles in — must precede the Web build.
+        run: yarn config:dev
+
+      - name: Build API (development)
+        run: |
+          yarn nx build api -c development --parallel=1 \
+            || { echo "::warning::api build failed — retry 1 (nx cache skips built deps)"; yarn nx build api -c development --parallel=1; }
+        env:
+          NX_ISOLATE_PLUGINS: 'false'
+          NX_DAEMON: 'false'
+
+      - name: Build Web (gauzy)
+        # 8192, not 12288: this is a plain GitHub-hosted ubuntu-latest runner, not the memory-limited
+        # self-hosted pod that workflows-upstream/test_playwright.yml sizes its heap for.
+        run: |
+          build() { node --max-old-space-size=8192 ./node_modules/nx/bin/nx.js build gauzy -c ci; }
+          build || { echo "::warning::gauzy build failed — retry 1 (nx cache skips done deps)"; build; }
+        env:
+          NX_ISOLATE_PLUGINS: 'false'
+          NX_DAEMON: 'false'
+
+      - name: Reset DB for a clean, deterministic seed
+        # Start from an empty DB so the API auto-seeds the default org/admin (admin@ever.co / admin).
+        run: rm -f apps/api/data/gauzy.sqlite3*
+
+      - name: Install forever
+        run: |
+          npm config set prefix "$HOME/.npm-global"
+          npm install forever -g
+          echo "$HOME/.npm-global/bin" >> "$GITHUB_PATH"
+
+      - name: Run API in background
+        run: forever start dist/apps/api/main.js
+        env:
+          NODE_OPTIONS: --max-old-space-size=12288
+          DEMO: 'false'
+          # MUST be in the process env before the API starts — the sqlite-vs-postgres column-type
+          # guard in @gauzy/config is captured at module load.
+          DB_TYPE: 'better-sqlite3'
+
+      - name: Serve Web (static) in background
+        run: forever start apps/gauzy-e2e/tools/serve-web.js dist/apps/gauzy 4200
+
+      - name: Wait for API and Web to be ready
+        run: |
+          deadline=$((SECONDS + 600))
+          while (( SECONDS < deadline )); do
+            api=$(curl -s -o /dev/null -w '%{http_code}' --max-time 3 http://localhost:3000/api || true)
+            web=$(curl -s -o /dev/null -w '%{http_code}' --max-time 3 http://localhost:4200 || true)
+            echo "waiting (${SECONDS}s): api=$api web=$web"
+            if [ "$api" != "000" ] && [ "$web" != "000" ]; then
+              echo "API (:3000) and Web (:4200) are up"; exit 0
+            fi
+            if npx forever list 2>/dev/null | grep -qi "STOPPED"; then
+              echo "::error::A server process crashed (forever reports STOPPED) — aborting early."; exit 1
+            fi
+            sleep 6
+          done
+          echo "::error::Timed out after ${SECONDS}s waiting for API/Web"; exit 1
+
+      - name: Report bring-up duration
+        if: always()
+        run: |
+          bringup_end=$(date +%s)
+          echo "Bring-up took $((bringup_end - BRINGUP_START))s"
+
+      - name: Server logs (diagnostic)
+        if: always()
+        run: |
+          npx forever list || true
+          for f in "$HOME"/.forever/*.log; do
+            [ -e "$f" ] || continue
+            echo "===== $f ====="
+            tail -120 "$f" || true
+          done
+
+      - name: Install Playwright browser (chromium)
+        run: npx playwright install --with-deps chromium
+
+      - name: Run e2e tests
+        run: |
+          test_start=$(date +%s)
+          yarn nx e2e poc-e2e
+          status=$?
+          test_end=$(date +%s)
+          echo "Test run took $((test_end - test_start))s"
+          exit $status
+        env:
+          CI: 'true'
