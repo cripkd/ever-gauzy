@@ -9,6 +9,13 @@ name: POC E2E
 # Node preinstalled (hence actions/setup-node, pinned the same way workflows-upstream/build.yml does)
 # and no port-sharing with other processes (hence API/Web keep their default ports, no :3000->:3001
 # rewrite of the built bundle).
+#
+# This workflow maintains its OWN node_modules cache (restore + save below) rather than reusing
+# workflows-upstream/build.yml's: GitHub Actions cache storage is per-repository and never shared
+# between a fork and its upstream, and on a fork nothing else populates it — build.yml is parked
+# (moved out of .github/workflows/, so GitHub Actions never runs it here) and no cache from the
+# upstream org repo is reachable from this one regardless. So this workflow is the only occupant of
+# this repo's 10 GB cache budget: safe to both read and write it.
 on:
   pull_request:
   workflow_dispatch:
@@ -22,8 +29,8 @@ env:
   # Nx Cloud is disabled for this org; without this, nx run-many/build hard-fails with
   # "Nx Cloud: Workspace is unable to be authorized. Exiting run."
   NX_NO_CLOUD: true
-  # Same filename workflows-upstream/build.yml uses for its own archive. Not a coincidence — the
-  # cache-restore step below deliberately targets THAT workflow's cache entry (see comment there).
+  # Same filename workflows-upstream/build.yml uses for its own archive, kept for consistency —
+  # this repo's cache storage is separate from that file's (see header comment).
   NODE_MODULES_ARCHIVE: node-modules.tar.zst
 
 permissions:
@@ -49,15 +56,11 @@ jobs:
       - name: Restore node_modules archive
         id: node-modules-cache
         uses: actions/cache/restore@v4
-        # Deliberately READ-ONLY (restore, no matching save step): this targets the exact cache key
-        # workflows-upstream/build.yml already writes on every push to develop/stage/master, so a hit
-        # here costs the shared 10 GB per-repo cache budget nothing extra. Key formula copied verbatim
-        # from that workflow so the hash lines up — see its own comments for why a cache MISS is the
-        # safe outcome (falls through to a real bootstrap below) and why this repo does NOT try to
-        # cache the raw ~11 GB node_modules tree directly (it doesn't fit; this compressed archive,
-        # measured there at ~2.9 GB, does). We don't save our own copy: a from-scratch bootstrap here
-        # is rare (most PRs hit build.yml's cache) and a write would risk evicting entries other
-        # workflows in this repo depend on — the exact incident that workflow's comments document.
+        # Key formula copied from workflows-upstream/build.yml (hash of the files that determine the
+        # installed tree) so the two WOULD line up if they ever shared cache storage — they don't
+        # (see header comment) — but this at least keeps the scheme consistent if that ever changes.
+        # A miss here is expected on the very first run on a fresh fork; every run after the first
+        # save (below) should hit, since nothing else on this repo touches this key.
         with:
           path: ${{ env.NODE_MODULES_ARCHIVE }}
           key: ${{ runner.os }}-${{ runner.arch }}-node-modules-${{ hashFiles('yarn.lock', 'package.json', 'patches/**', '.scripts/postinstall.js') }}
@@ -67,6 +70,24 @@ jobs:
         # Unpacks the archive on a cache hit; bootstraps from scratch (yarn bootstrap:ci, with its
         # own retry-once) on a miss. Shared script — see .github/scripts/restore-node-modules.sh.
         run: .github/scripts/restore-node-modules.sh
+
+      - name: Archive node_modules
+        if: steps.node-modules-cache.outputs.cache-hit != 'true'
+        shell: bash
+        # Only on a miss: pack the tree we just bootstrapped so the save step below can publish it.
+        # Shared script — see .github/scripts/archive-node-modules.sh (also used by build.yml).
+        run: .github/scripts/archive-node-modules.sh
+
+      - name: Save node_modules archive
+        if: steps.node-modules-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        continue-on-error: true
+        # Pinned to the key the RESTORE step computed (cache-primary-key), not re-derived: matches
+        # workflows-upstream/build.yml's own reasoning for doing this, and keeps us consistent with
+        # it even though the two repos' cache storage is separate.
+        with:
+          path: ${{ env.NODE_MODULES_ARCHIVE }}
+          key: ${{ steps.node-modules-cache.outputs.cache-primary-key }}
 
       - name: Build all packages
         # Mandatory before anything serves: the API and Web builds below depend on the compiled
