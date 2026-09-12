@@ -162,3 +162,6 @@ apps/server-api/src/assets/icons/menu
 /graphify-out
 
 /Tempnx-console-tmp**/**
+
+.claude/worktrees
+.claude/settings.local.json
