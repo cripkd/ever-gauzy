@@ -1,0 +1,21 @@
+name: Agent Intake
+
+# Stub: fires once per clickup-intake dispatch from poll-clickup-intake.yml. Currently
+# just echoes the ticket id so the dispatch path can be verified end to end. The actual
+# Claude/DoR-rewrite invocation for this ticket gets filled in here later.
+
+on:
+  repository_dispatch:
+    types: [clickup-intake]
+
+permissions:
+  contents: read
+
+jobs:
+  intake:
+    name: Handle intake dispatch
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Echo ticket id
+        run: echo "Received clickup-intake dispatch for ticket ${{ github.event.client_payload.ticket_id }}"
