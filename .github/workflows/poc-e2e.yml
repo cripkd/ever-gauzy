@@ -43,13 +43,15 @@ jobs:
       - name: Start bring-up timer
         run: echo "BRINGUP_START=$(date +%s)" >> "$GITHUB_ENV"
 
-      - name: Install & bootstrap dependencies
+      - name: Yarn install
         # Retry once, like workflows-upstream/test_playwright.yml: a transient registry/FS hiccup
         # on a fresh runner is common enough that one retry is worth it before failing the run.
         run: |
-          run: yarn install --frozen-lockfile --ignore-scripts\
+          yarn install --frozen-lockfile --ignore-scripts\
             || { echo "::warning::yarn install failed — retry 1"; yarn bootstrap; }
-          run: yarn postinstall.manual \
+      - name: Yarn postinstall
+        run: |
+          yarn postinstall.manual \
             || { echo "::warning::yarn postinstall failed — retry 1"; yarn bootstrap; }
 
       - name: Build all packages
