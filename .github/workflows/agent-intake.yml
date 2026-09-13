@@ -1,21 +1,220 @@
 name: Agent Intake
 
-# Stub: fires once per clickup-intake dispatch from poll-clickup-intake.yml. Currently
-# just echoes the ticket id so the dispatch path can be verified end to end. The actual
-# Claude/DoR-rewrite invocation for this ticket gets filled in here later.
+# Fires once per clickup-intake dispatch from poll-clickup-intake.yml. Everything that
+# touches ClickUp is a plain, deterministic curl call in this workflow — Claude never
+# gets ClickUp credentials, a ClickUp tool, or network access. Its only job is prose in,
+# prose out: given the ticket's original description and the right DoR template, it
+# writes a rewritten description to a file. See prompts/intake-rewrite.md for its exact
+# contract.
+#
+# Flow:
+#   1. GET  the task, verbatim-guard: if Original report is already populated, stop.
+#   2. POST the original description into Original report, verbatim (bash does the
+#      copy, not the model — this is what guarantees "verbatim").
+#   3. claude -p, no MCP/Bash/network, Read+Write scoped to an isolated scratch dir
+#      containing only original.txt + template.md, writes rewritten.md.
+#   4. PUT  the rewritten content back as the task's description.
 
 on:
   repository_dispatch:
     types: [clickup-intake]
 
+concurrency:
+  group: agent-intake-${{ github.event.client_payload.ticket_id }}
+  cancel-in-progress: false
+
 permissions:
   contents: read
 
+env:
+  ORIGINAL_REPORT_FIELD_ID: ${{ vars.ORIGINAL_REPORT_FIELD_ID }}
+  BUG_CUSTOM_ITEM_ID: ${{ vars.BUG_CUSTOM_ITEM_ID }}
+  TICKET_ID: ${{ github.event.client_payload.ticket_id }}
+
 jobs:
   intake:
-    name: Handle intake dispatch
+    name: Rewrite ticket to DoR form
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 10
     steps:
-      - name: Echo ticket id
-        run: echo "Received clickup-intake dispatch for ticket ${{ github.event.client_payload.ticket_id }}"
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: Install Claude Code CLI
+        run: npm install -g @anthropic-ai/claude-code
+
+      - name: Fetch the task
+        id: fetch
+        env:
+          CLICKUP_API_TOKEN: ${{ secrets.CLICKUP_API_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          http_code=$(curl -sS -o task.json -w '%{http_code}' \
+            -H "Authorization: ${CLICKUP_API_TOKEN}" \
+            "https://api.clickup.com/api/v2/task/${TICKET_ID}")
+
+          if [ "$http_code" -lt 200 ] || [ "$http_code" -ge 300 ]; then
+            echo "::error::ClickUp GET task returned HTTP ${http_code}"
+            cat task.json
+            exit 1
+          fi
+
+      - name: 'Guard: skip if already processed'
+        id: guard
+        run: |
+          set -euo pipefail
+
+          # Same absent-or-blank check poll-clickup-intake.yml uses before it ever
+          # dispatches — re-checked here as defense-in-depth against a double dispatch
+          # (e.g. two poll cycles racing, or a manual workflow_dispatch during testing).
+          already_processed=$(jq -r --arg fid "$ORIGINAL_REPORT_FIELD_ID" '
+            (.custom_fields // []) | map(select(.id == $fid)) | .[0] as $field
+            | if ($field == null)
+                or (($field | has("value")) | not)
+                or ($field.value == null)
+                or (($field.value | type) == "string" and ($field.value | test("^\\s*$")))
+              then "false" else "true" end
+          ' task.json)
+
+          echo "already_processed=${already_processed}" >> "$GITHUB_OUTPUT"
+
+          if [ "$already_processed" = "true" ]; then
+            echo "Ticket ${TICKET_ID}: Original report already populated — already-processed."
+          fi
+
+      - name: Copy original description into Original report, verbatim
+        if: steps.guard.outputs.already_processed == 'false'
+        id: original
+        env:
+          CLICKUP_API_TOKEN: ${{ secrets.CLICKUP_API_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          # jq -r on a missing/null description yields the literal string "null", not
+          # empty — guard the fallback inside the filter itself, not after.
+          jq -r '.description // ""' task.json > original.txt
+          jq -r '.custom_item_id // ""' task.json > custom-item-id.txt
+
+          payload=$(jq -n --rawfile v original.txt '{value: $v}')
+
+          http_code=$(curl -sS -o field-response.json -w '%{http_code}' \
+            -X POST \
+            -H "Authorization: ${CLICKUP_API_TOKEN}" \
+            -H "Content-Type: application/json" \
+            "https://api.clickup.com/api/v2/task/${TICKET_ID}/field/${ORIGINAL_REPORT_FIELD_ID}" \
+            -d "$payload")
+
+          if [ "$http_code" -lt 200 ] || [ "$http_code" -ge 300 ]; then
+            echo "::error::ClickUp POST custom field returned HTTP ${http_code}"
+            cat field-response.json
+            exit 1
+          fi
+
+          echo "Copied original description into Original report (verbatim, $(wc -c < original.txt) bytes)."
+
+      - name: Select the DoR template
+        if: steps.guard.outputs.already_processed == 'false'
+        run: |
+          set -euo pipefail
+
+          custom_item_id=$(cat custom-item-id.txt)
+          if [ "$custom_item_id" = "$BUG_CUSTOM_ITEM_ID" ]; then
+            template=docs/poc/templates/dor-bug.md
+          else
+            template=docs/poc/templates/dor-feature.md
+          fi
+
+          echo "Ticket ${TICKET_ID}: custom_item_id=${custom_item_id:-<none>} -> ${template}"
+          cp "$template" template.md
+
+      - name: Run the intake-rewrite agent
+        if: steps.guard.outputs.already_processed == 'false'
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          set -euo pipefail
+
+          # Isolated scratch dir, NOT the repo checkout: Claude's Read/Write access has
+          # nothing else in scope to touch, whatever it's scoped to. No MCP, no Bash, no
+          # network tool at all — its only capability is reading these two files and
+          # writing one back.
+          workdir="${RUNNER_TEMP}/agent-intake"
+          mkdir -p "$workdir"
+          mv original.txt template.md "$workdir/"
+
+          prompt="$(cat prompts/intake-rewrite.md)"
+
+          (
+            cd "$workdir"
+            claude -p "$prompt" \
+              --allowed-tools "Read,Write" \
+              --max-turns 8 \
+              --output-format stream-json --verbose
+          )
+
+          if [ ! -s "$workdir/rewritten.md" ]; then
+            echo "::error::rewritten.md was not produced (or is empty) for ticket ${TICKET_ID}"
+            exit 1
+          fi
+
+          cp "$workdir/rewritten.md" rewritten.md
+
+      - name: Write the rewritten description back
+        if: steps.guard.outputs.already_processed == 'false'
+        env:
+          CLICKUP_API_TOKEN: ${{ secrets.CLICKUP_API_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          unknown_line=$(tail -n1 rewritten.md)
+          # -E (POSIX extended regex), not \+/\{0,1\}: those are GNU BRE extensions that
+          # BSD sed (macOS, used to verify this logic locally) doesn't support.
+          unknown_count=$(printf '%s' "$unknown_line" | sed -n -E 's/^UNKNOWN_COUNT: *(-?[0-9]+)$/\1/p')
+
+          if [ -z "$unknown_count" ]; then
+            echo "::error::rewritten.md's last line isn't a valid UNKNOWN_COUNT marker: ${unknown_line}"
+            exit 1
+          fi
+
+          if [ "$unknown_count" = "-1" ]; then
+            echo "::error::Ticket ${TICKET_ID}: original description was empty or unintelligible — description left unchanged, needs manual attention."
+            exit 1
+          fi
+
+          # Description is everything except the trailing UNKNOWN_COUNT line.
+          # sed '$d' (POSIX), not `head -n -1`: negative counts are a GNU-only extension.
+          sed '$d' rewritten.md > description.txt
+
+          payload=$(jq -n --rawfile v description.txt '{description: $v}')
+
+          http_code=$(curl -sS -o update-response.json -w '%{http_code}' \
+            -X PUT \
+            -H "Authorization: ${CLICKUP_API_TOKEN}" \
+            -H "Content-Type: application/json" \
+            "https://api.clickup.com/api/v2/task/${TICKET_ID}" \
+            -d "$payload")
+
+          if [ "$http_code" -lt 200 ] || [ "$http_code" -ge 300 ]; then
+            echo "::error::ClickUp PUT task returned HTTP ${http_code}"
+            cat update-response.json
+            exit 1
+          fi
+
+          echo "Ticket ${TICKET_ID}: rewritten (unknown items: ${unknown_count})."
+
+      - name: Summary
+        if: always()
+        run: |
+          if [ "${{ steps.guard.outputs.already_processed }}" = "true" ]; then
+            echo "Ticket ${TICKET_ID}: already-processed."
+          elif [ "${{ job.status }}" = "success" ]; then
+            echo "Ticket ${TICKET_ID}: rewritten."
+          else
+            echo "Ticket ${TICKET_ID}: failed."
+          fi
