@@ -127,8 +127,10 @@ jobs:
         with:
           node-version: 24
 
-      - name: Install the openspec CLI
-        run: npm install -g @fission-ai/openspec
+      - name: Install the Claude Code and openspec CLIs
+        run: |
+          npm install -g @anthropic-ai/claude-code
+          npm install -g @fission-ai/openspec
 
       - name: Write the ticket to ticket.md
         env:
@@ -166,7 +168,7 @@ jobs:
       - name: Run the propose agent
         id: agent
         env:
-          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
         run: |
           set -euo pipefail
 
