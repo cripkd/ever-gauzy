@@ -1,0 +1,292 @@
+name: Agent Propose
+
+# Fires once per clickup-propose dispatch from poll-clickup-propose.yml. Turns one
+# ClickUp ticket into an OpenSpec change proposal (proposal.md, spec delta, tasks.md) on
+# its own branch, opened as a draft PR for a human to review. Never merges anything
+# itself, and never touches application code — see prompts/propose.md for
+# Claude's exact contract; it writes openspec/ artifacts only.
+#
+# Flow:
+#   1. PUT status -> spec proposed. FIRST action, before checkout. This is the dispatch
+#      lock: poll-clickup-propose.yml only ever queries statuses[]=ready%20for%20spec,
+#      so a ticket moved out of that status can't be re-dispatched by a later poll
+#      cycle. If this fails, exit immediately — nothing else can safely proceed without
+#      knowing the lock was actually acquired.
+#   2. Full checkout (fetch-depth: 0), create the branch via the GitHub API (atomic —
+#      fails with a real error if it already exists, unlike a plain `git push` of an
+#      identical commit, which would silently no-op-succeed), check it out.
+#   3. Install the openspec CLI only — no repo dependency install, propose doesn't
+#      touch application code.
+#   4. Write the ticket's description to ticket.md at the repo root (git-ignored
+#      locally via .git/info/exclude, never the tracked .gitignore — it must never be
+#      committed, and touching the tracked .gitignore would itself be a change outside
+#      openspec/).
+#   5. claude -p, --allowed-tools "Read,Write,Edit,Glob,Grep,Bash(openspec:*)", no MCP.
+#      Codebase exploration and file changes go through Read/Write/Edit/Glob/Grep —
+#      Bash is scoped to openspec:* only, since driving the openspec CLI is the one
+#      thing here that genuinely needs a shell (matching this repo's own reference
+#      openspec-propose/openspec-apply-change skills, which scope the same way).
+#      Verified locally that this narrower scope is actually sufficient, not just
+#      theoretically: a full propose run completes correctly with it, independently
+#      re-validated. Working directory is the repo root — propose needs to explore the
+#      actual codebase, unlike intake's pure text rewrite. Never
+#      --dangerously-skip-permissions.
+#   6. Verify git status --porcelain touched nothing outside openspec/ — always, before
+#      branching on the result. This is a safety check independent of what Claude
+#      claims to have done, and applies whether or not the proposal is complete.
+#   7. RESULT: insufficient-detail -> back to "in spec" + a comment explaining why, no
+#      PR, no validate gate (an intentionally-incomplete proposal isn't expected to
+#      pass one). Otherwise: openspec validate --changes --strict, then commit, push,
+#      open a draft PR.
+#   8. Any failure from step 2 onward: tag "needs human" + comment with the run URL, so
+#      a failed run doesn't just leave the ticket silently sitting in "spec proposed"
+#      with nothing to see.
+
+on:
+  repository_dispatch:
+    types: [clickup-propose]
+
+concurrency:
+  group: agent-propose-${{ github.event.client_payload.ticket_id }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  pull-requests: write
+
+env:
+  TICKET_ID: ${{ github.event.client_payload.ticket_id }}
+
+jobs:
+  propose:
+    name: Propose a spec for a ticket
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Move task to spec proposed (dispatch lock)
+        id: lock
+        env:
+          CLICKUP_API_TOKEN: ${{ secrets.CLICKUP_API_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          payload=$(jq -n '{status: "spec proposed"}')
+
+          http_code=$(curl -sS -o "${RUNNER_TEMP}/lock-response.json" -w '%{http_code}' \
+            -X PUT \
+            -H "Authorization: ${CLICKUP_API_TOKEN}" \
+            -H "Content-Type: application/json" \
+            "https://api.clickup.com/api/v2/task/${TICKET_ID}" \
+            -d "$payload")
+
+          if [ "$http_code" -lt 200 ] || [ "$http_code" -ge 300 ]; then
+            echo "::error::ClickUp PUT status returned HTTP ${http_code} — could not acquire the dispatch lock, stopping."
+            cat "${RUNNER_TEMP}/lock-response.json"
+            exit 1
+          fi
+
+          echo "Ticket ${TICKET_ID}: moved to \"spec proposed\"."
+
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Create and check out the proposal branch
+        env:
+          GH_API_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          branch="poc/${TICKET_ID}"
+          sha=$(git rev-parse HEAD)
+
+          # The git ref-creation API is atomic: 422 if the ref already exists. A plain
+          # `git push` of a brand-new local branch would silently succeed even if the
+          # branch already exists remotely at this exact commit (a no-op fast-forward,
+          # not an error), which would defeat "exit if it already exists" entirely.
+          http_code=$(curl -sS -o "${RUNNER_TEMP}/branch-response.json" -w '%{http_code}' \
+            -X POST \
+            -H "Authorization: Bearer ${GH_API_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "https://api.github.com/repos/${{ github.repository }}/git/refs" \
+            -d "$(jq -n --arg ref "refs/heads/${branch}" --arg sha "$sha" '{ref: $ref, sha: $sha}')")
+
+          if [ "$http_code" -lt 200 ] || [ "$http_code" -ge 300 ]; then
+            echo "::error::Could not create branch ${branch} (HTTP ${http_code}) — it may already exist."
+            cat "${RUNNER_TEMP}/branch-response.json"
+            exit 1
+          fi
+
+          git fetch origin "$branch"
+          git checkout -B "$branch" "origin/$branch"
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: Install the openspec CLI
+        run: npm install -g @fission-ai/openspec
+
+      - name: Write the ticket to ticket.md
+        env:
+          CLICKUP_API_TOKEN: ${{ secrets.CLICKUP_API_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          task_json="${RUNNER_TEMP}/task.json"
+
+          http_code=$(curl -sS -o "$task_json" -w '%{http_code}' \
+            -H "Authorization: ${CLICKUP_API_TOKEN}" \
+            "https://api.clickup.com/api/v2/task/${TICKET_ID}")
+
+          if [ "$http_code" -lt 200 ] || [ "$http_code" -ge 300 ]; then
+            echo "::error::ClickUp GET task returned HTTP ${http_code}"
+            cat "$task_json"
+            exit 1
+          fi
+
+          # Original report is intake's pre-rewrite artifact; propose works from the
+          # current (already DoR-rewritten) description only.
+          jq -r '.description // ""' "$task_json" > ticket.md
+
+          # Locally ignored, not via the tracked .gitignore: ticket.md must never be
+          # committed, and appending to the tracked .gitignore would itself be a change
+          # outside openspec/ in the scope check below.
+          echo "ticket.md" >> .git/info/exclude
+
+          {
+            echo "TICKET_TITLE<<TICKET_TITLE_EOF"
+            jq -r '.name' "$task_json"
+            echo "TICKET_TITLE_EOF"
+          } >> "$GITHUB_ENV"
+
+      - name: Run the propose agent
+        id: agent
+        env:
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          prompt="$(cat prompts/propose.md)"
+          output_file="${RUNNER_TEMP}/claude-output.txt"
+
+          claude -p "$prompt" \
+            --allowed-tools "Read,Write,Edit,Glob,Grep,Bash(openspec:*)" \
+            > "$output_file"
+
+          cat "$output_file"
+
+          result=$(grep -m1 '^RESULT:' "$output_file" | sed 's/^RESULT: *//')
+          echo "result=${result}" >> "$GITHUB_OUTPUT"
+
+      - name: Verify nothing changed outside openspec/
+        run: |
+          set -euo pipefail
+
+          # --untracked-files=all: without it, git collapses a brand-new untracked
+          # directory (which is exactly what a new openspec change is) into a single
+          # line ending in "/", which the proposal_path lookup below can't match against.
+          out_of_scope=$(git status --porcelain --untracked-files=all | cut -c4- | grep -v '^openspec/' || true)
+          if [ -n "$out_of_scope" ]; then
+            echo "::error::Files changed outside openspec/ — leaving the branch as-is for inspection:"
+            echo "$out_of_scope"
+            exit 1
+          fi
+
+      - name: Handle insufficient detail
+        if: steps.agent.outputs.result == 'insufficient-detail'
+        env:
+          CLICKUP_API_TOKEN: ${{ secrets.CLICKUP_API_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          proposal_path=$(git status --porcelain --untracked-files=all | cut -c4- | grep '/proposal\.md$' | head -n1 || true)
+          if [ -n "$proposal_path" ] && [ -f "$proposal_path" ]; then
+            comment_source="$proposal_path"
+          else
+            comment_source="${RUNNER_TEMP}/claude-output.txt"
+          fi
+
+          # ClickUp comments have a real size limit; keep this well under it.
+          comment_text=$(head -c 3000 "$comment_source")
+
+          status_payload=$(jq -n '{status: "in spec"}')
+          http_code=$(curl -sS -o "${RUNNER_TEMP}/revert-response.json" -w '%{http_code}' \
+            -X PUT \
+            -H "Authorization: ${CLICKUP_API_TOKEN}" \
+            -H "Content-Type: application/json" \
+            "https://api.clickup.com/api/v2/task/${TICKET_ID}" \
+            -d "$status_payload")
+
+          if [ "$http_code" -lt 200 ] || [ "$http_code" -ge 300 ]; then
+            echo "::error::ClickUp PUT status (revert to in spec) returned HTTP ${http_code}"
+            cat "${RUNNER_TEMP}/revert-response.json"
+            exit 1
+          fi
+
+          comment_payload=$(jq -n --arg t "$comment_text" '{comment_text: $t, notify_all: false}')
+          http_code=$(curl -sS -o "${RUNNER_TEMP}/comment-response.json" -w '%{http_code}' \
+            -X POST \
+            -H "Authorization: ${CLICKUP_API_TOKEN}" \
+            -H "Content-Type: application/json" \
+            "https://api.clickup.com/api/v2/task/${TICKET_ID}/comment" \
+            -d "$comment_payload")
+
+          if [ "$http_code" -lt 200 ] || [ "$http_code" -ge 300 ]; then
+            echo "::error::ClickUp POST comment returned HTTP ${http_code}"
+            cat "${RUNNER_TEMP}/comment-response.json"
+            exit 1
+          fi
+
+          echo "Ticket ${TICKET_ID}: insufficient detail — reverted to \"in spec\", commented, no PR."
+
+      - name: Validate the proposal
+        if: steps.agent.outputs.result != 'insufficient-detail'
+        # --changes, not just --strict: bare `openspec validate --strict` returns
+        # "Nothing to validate" (exit 1) with no target — verified locally, it doesn't
+        # default to validating everything. --changes covers it without needing to know
+        # Claude's dynamically-chosen change name.
+        run: openspec validate --changes --strict
+
+      - name: Commit, push, and open the draft PR
+        if: steps.agent.outputs.result != 'insufficient-detail'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          git add openspec/
+          git commit -m "Propose spec for ${TICKET_ID}"
+          git push origin "poc/${TICKET_ID}"
+
+          title="[${TICKET_ID}] ${TICKET_TITLE}"
+          body="Proposes a spec for https://app.clickup.com/t/${TICKET_ID}"
+
+          gh pr create --draft --title "$title" --body "$body" --head "poc/${TICKET_ID}"
+
+      - name: On failure after the lock, flag for a human
+        if: failure() && steps.lock.outcome == 'success'
+        continue-on-error: true
+        env:
+          CLICKUP_API_TOKEN: ${{ secrets.CLICKUP_API_TOKEN }}
+        run: |
+          run_url="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+
+          curl -sS -o /dev/null -w 'tag: %{http_code}\n' \
+            -X POST \
+            -H "Authorization: ${CLICKUP_API_TOKEN}" \
+            "https://api.clickup.com/api/v2/task/${TICKET_ID}/tag/needs-human"
+
+          comment_payload=$(jq -n --arg t "Automated spec proposal failed. Run: ${run_url}" '{comment_text: $t, notify_all: false}')
+          curl -sS -o /dev/null -w 'comment: %{http_code}\n' \
+            -X POST \
+            -H "Authorization: ${CLICKUP_API_TOKEN}" \
+            -H "Content-Type: application/json" \
+            "https://api.clickup.com/api/v2/task/${TICKET_ID}/comment" \
+            -d "$comment_payload"
