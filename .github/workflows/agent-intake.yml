@@ -9,11 +9,15 @@ name: Agent Intake
 #
 # Flow:
 #   1. GET  the task, verbatim-guard: if Original report is already populated, stop.
-#   2. POST the original description into Original report, verbatim (bash does the
+#   2. PUT  status -> IN SPEC, first thing after the guard passes. This is itself a
+#      second guard, cheaper than the first: poll-clickup-intake.yml only ever queries
+#      `statuses[]=to%20do`, so a ticket moved out of to do can't be re-dispatched by
+#      the next poll cycle while this run is still working it.
+#   3. POST the original description into Original report, verbatim (bash does the
 #      copy, not the model — this is what guarantees "verbatim").
-#   3. claude -p, no MCP/Bash/network, Read+Write scoped to an isolated scratch dir
+#   4. claude -p, no MCP/Bash/network, Read+Write scoped to an isolated scratch dir
 #      containing only original.txt + template.md, writes rewritten.md.
-#   4. PUT  the rewritten content back as the task's description.
+#   5. PUT  the rewritten content back as the task's description.
 
 on:
   repository_dispatch:
@@ -30,6 +34,7 @@ env:
   ORIGINAL_REPORT_FIELD_ID: ${{ vars.ORIGINAL_REPORT_FIELD_ID }}
   BUG_CUSTOM_ITEM_ID: ${{ vars.BUG_CUSTOM_ITEM_ID }}
   TICKET_ID: ${{ github.event.client_payload.ticket_id }}
+  IN_SPEC_STATUS: ${{ vars.IN_SPEC_STATUS }}
   # Pinned rather than left to the CLI's built-in default: an unpinned default can
   # change silently (e.g. on a claude-code upgrade) and this pipeline doesn't leave
   # anything else to chance either. Set as a repo variable, same place as the others.
@@ -91,6 +96,35 @@ jobs:
           if [ "$already_processed" = "true" ]; then
             echo "Ticket ${TICKET_ID}: Original report already populated — already-processed."
           fi
+
+      - name: Move task to IN SPEC
+        if: steps.guard.outputs.already_processed == 'false'
+        env:
+          CLICKUP_API_TOKEN: ${{ secrets.CLICKUP_API_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          # First thing after the guard passes, deliberately before any other write:
+          # this takes the ticket out of `to do`, which is the status
+          # poll-clickup-intake.yml polls on — so a concurrent or later poll cycle
+          # can no longer re-dispatch it while this run is still working it.
+          status="${IN_SPEC_STATUS:-in spec}"
+          payload=$(jq -n --arg s "$status" '{status: $s}')
+
+          http_code=$(curl -sS -o status-response.json -w '%{http_code}' \
+            -X PUT \
+            -H "Authorization: ${CLICKUP_API_TOKEN}" \
+            -H "Content-Type: application/json" \
+            "https://api.clickup.com/api/v2/task/${TICKET_ID}" \
+            -d "$payload")
+
+          if [ "$http_code" -lt 200 ] || [ "$http_code" -ge 300 ]; then
+            echo "::error::ClickUp PUT status returned HTTP ${http_code}"
+            cat status-response.json
+            exit 1
+          fi
+
+          echo "Ticket ${TICKET_ID}: moved to \"${status}\"."
 
       - name: Copy original description into Original report, verbatim
         if: steps.guard.outputs.already_processed == 'false'
