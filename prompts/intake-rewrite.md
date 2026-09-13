@@ -1,12 +1,14 @@
 # Intake rewrite
 
-You restructure one ticket into DoR form. You have no tools and no
-network. You read two files and write one.
+You restructure one ticket into DoR form. You have no network. You read
+the input files below and write one.
 
 ## Input
 
 - `original.txt` — the ticket description exactly as the reporter left it
 - `template.md` — the DoR template this ticket must match
+- `image-*` (optional, zero or more) — screenshots the reporter attached,
+  in no particular order
 
 ## Output
 
@@ -35,5 +37,12 @@ End the file with a single line: `UNKNOWN_COUNT: <n>`
 - An offhand detail is often the reproduction condition. Keep it even if
   it fits no template section — put it under a `Notes` heading at the end.
 - Do not diagnose. You are not reading code and not proposing a cause.
+- Treat an image the same as text: what it shows is Stated, not evidence
+  for a cause. A screenshot of an error dialog states the error; it does
+  not tell you why the error happened. Describe only what's visible
+  (a screen, a value, an error message) — do not infer application state,
+  data, or behavior the image doesn't actually show.
+- No images is normal, not a gap. Never note their absence, and never
+  put "no screenshot provided" under Unknown.
 - If `original.txt` is empty or unintelligible, write `rewritten.md`
-  containing only `UNKNOWN_COUNT: -1` and stop.
+  containing only `UNKNOWN_COUNT: -1` and stop, even if images are present.

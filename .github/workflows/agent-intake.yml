@@ -133,6 +133,33 @@ jobs:
           echo "Ticket ${TICKET_ID}: custom_item_id=${custom_item_id:-<none>} -> ${template}"
           cp "$template" template.md
 
+      - name: Download attached images
+        if: steps.guard.outputs.already_processed == 'false'
+        env:
+          CLICKUP_API_TOKEN: ${{ secrets.CLICKUP_API_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          # Cap at 5 images per ticket — same "misconfiguration can't run wild"
+          # discipline as the dispatch cap in poll-clickup-intake.yml.
+          mkdir -p images
+          jq -r '
+            (.attachments // [])
+            | map(select((.mimetype // "") | startswith("image/")))
+            | .[:5][]
+            | [.url, (.extension // "png")] | @tsv
+          ' task.json > image-list.tsv
+
+          n=0
+          while IFS="$(printf '\t')" read -r url ext; do
+            n=$((n + 1))
+            curl -sS -o "images/image-${n}.${ext}" \
+              -H "Authorization: ${CLICKUP_API_TOKEN}" \
+              "$url"
+          done < image-list.tsv
+
+          echo "Downloaded ${n} image(s) from ticket ${TICKET_ID}."
+
       - name: Run the intake-rewrite agent
         if: steps.guard.outputs.already_processed == 'false'
         env:
@@ -142,11 +169,14 @@ jobs:
 
           # Isolated scratch dir, NOT the repo checkout: Claude's Read/Write access has
           # nothing else in scope to touch, whatever it's scoped to. No MCP, no Bash, no
-          # network tool at all — its only capability is reading these two files and
+          # network tool at all — its only capability is reading these files and
           # writing one back.
           workdir="${RUNNER_TEMP}/agent-intake"
           mkdir -p "$workdir"
           mv original.txt template.md "$workdir/"
+          if [ -n "$(ls -A images 2>/dev/null)" ]; then
+            mv images/* "$workdir/"
+          fi
 
           prompt="$(cat prompts/intake-rewrite.md)"
 
