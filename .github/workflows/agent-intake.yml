@@ -30,6 +30,10 @@ env:
   ORIGINAL_REPORT_FIELD_ID: ${{ vars.ORIGINAL_REPORT_FIELD_ID }}
   BUG_CUSTOM_ITEM_ID: ${{ vars.BUG_CUSTOM_ITEM_ID }}
   TICKET_ID: ${{ github.event.client_payload.ticket_id }}
+  # Pinned rather than left to the CLI's built-in default: an unpinned default can
+  # change silently (e.g. on a claude-code upgrade) and this pipeline doesn't leave
+  # anything else to chance either. Set as a repo variable, same place as the others.
+  CLAUDE_MODEL: ${{ vars.CLAUDE_MODEL }}
 
 jobs:
   intake:
@@ -179,10 +183,13 @@ jobs:
           fi
 
           prompt="$(cat prompts/intake-rewrite.md)"
+          model="${CLAUDE_MODEL:-claude-sonnet-5}"
+          echo "Using model: ${model}"
 
           (
             cd "$workdir"
             claude -p "$prompt" \
+              --model "$model" \
               --allowed-tools "Read,Write" \
               --max-turns 8 \
               --output-format stream-json --verbose
