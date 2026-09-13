@@ -14,9 +14,14 @@ name: Agent Propose
 #      knowing the lock was actually acquired.
 #   2. Full checkout (fetch-depth: 0), create the branch via the GitHub API (atomic —
 #      fails with a real error if it already exists, unlike a plain `git push` of an
-#      identical commit, which would silently no-op-succeed), check it out.
-#   3. Install the openspec CLI only — no repo dependency install, propose doesn't
-#      touch application code.
+#      identical commit, which would silently no-op-succeed), check it out. If it
+#      already exists, compare it against the default branch first: ahead_by 0 means
+#      it's provably empty (a leftover from a run that failed before ever committing —
+#      e.g. a missing tool), so it's deleted and recreated rather than permanently
+#      blocking every future retry. ahead_by > 0 means real content exists and is left
+#      alone, exactly as before.
+#   3. Install Claude Code and the openspec CLI — no repo dependency install, propose
+#      doesn't touch application code.
 #   4. Write the ticket's description to ticket.md at the repo root (git-ignored
 #      locally via .git/info/exclude, never the tracked .gitignore — it must never be
 #      committed, and touching the tracked .gitignore would itself be a change outside
@@ -33,7 +38,12 @@ name: Agent Propose
 #      --dangerously-skip-permissions.
 #   6. Verify git status --porcelain touched nothing outside openspec/ — always, before
 #      branching on the result. This is a safety check independent of what Claude
-#      claims to have done, and applies whether or not the proposal is complete.
+#      claims to have done, and applies whether or not the proposal is complete. On a
+#      violation, everything (including the offending files) is committed and pushed
+#      to the branch before failing — otherwise "leave the branch for inspection" would
+#      leave nothing to actually inspect once the runner's filesystem is gone, and this
+#      is also what keeps step 2's cleanup from treating it as an empty, safe-to-delete
+#      branch on a later retry.
 #   7. RESULT: insufficient-detail -> back to "in spec" + a comment explaining why, no
 #      PR, no validate gate (an intentionally-incomplete proposal isn't expected to
 #      pass one). Otherwise: openspec validate --changes --strict, then commit, push,
@@ -100,21 +110,51 @@ jobs:
 
           branch="poc/${TICKET_ID}"
           sha=$(git rev-parse HEAD)
+          api="https://api.github.com/repos/${{ github.repository }}"
+
+          create_branch() {
+            curl -sS -o "${RUNNER_TEMP}/branch-response.json" -w '%{http_code}' \
+              -X POST \
+              -H "Authorization: Bearer ${GH_API_TOKEN}" \
+              -H "Accept: application/vnd.github+json" \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
+              "${api}/git/refs" \
+              -d "$(jq -n --arg ref "refs/heads/${branch}" --arg sha "$sha" '{ref: $ref, sha: $sha}')"
+          }
 
           # The git ref-creation API is atomic: 422 if the ref already exists. A plain
           # `git push` of a brand-new local branch would silently succeed even if the
           # branch already exists remotely at this exact commit (a no-op fast-forward,
           # not an error), which would defeat "exit if it already exists" entirely.
-          http_code=$(curl -sS -o "${RUNNER_TEMP}/branch-response.json" -w '%{http_code}' \
-            -X POST \
-            -H "Authorization: Bearer ${GH_API_TOKEN}" \
-            -H "Accept: application/vnd.github+json" \
-            -H "X-GitHub-Api-Version: 2022-11-28" \
-            "https://api.github.com/repos/${{ github.repository }}/git/refs" \
-            -d "$(jq -n --arg ref "refs/heads/${branch}" --arg sha "$sha" '{ref: $ref, sha: $sha}')")
+          http_code=$(create_branch)
+
+          if [ "$http_code" -eq 422 ]; then
+            # Already exists — but a run that failed before ever committing (e.g. a
+            # missing tool, a transient API error) leaves an empty branch behind that
+            # would otherwise block every retry forever. ahead_by == 0 means it has no
+            # commits of its own beyond the current default branch: provably empty,
+            # safe to delete and recreate. ahead_by > 0 means real work exists (either
+            # a genuinely in-flight run, or content pushed by the scope-violation check
+            # below) — leave it alone and fail loudly, exactly as before.
+            ahead_by=$(curl -sS -H "Authorization: Bearer ${GH_API_TOKEN}" \
+              -H "Accept: application/vnd.github+json" \
+              "${api}/compare/${{ github.event.repository.default_branch }}...${branch}" \
+              | jq '.ahead_by')
+
+            if [ "$ahead_by" = "0" ]; then
+              echo "poc/${TICKET_ID} exists but is empty (ahead_by 0) — deleting and recreating."
+              curl -sS -o /dev/null -w 'delete: %{http_code}\n' \
+                -X DELETE \
+                -H "Authorization: Bearer ${GH_API_TOKEN}" \
+                -H "Accept: application/vnd.github+json" \
+                "${api}/git/refs/heads/${branch}"
+
+              http_code=$(create_branch)
+            fi
+          fi
 
           if [ "$http_code" -lt 200 ] || [ "$http_code" -ge 300 ]; then
-            echo "::error::Could not create branch ${branch} (HTTP ${http_code}) — it may already exist."
+            echo "::error::Could not create branch ${branch} (HTTP ${http_code}) — it has unmerged work and needs manual attention."
             cat "${RUNNER_TEMP}/branch-response.json"
             exit 1
           fi
@@ -185,6 +225,8 @@ jobs:
           echo "result=${result}" >> "$GITHUB_OUTPUT"
 
       - name: Verify nothing changed outside openspec/
+        env:
+          GH_API_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
 
@@ -193,8 +235,21 @@ jobs:
           # line ending in "/", which the proposal_path lookup below can't match against.
           out_of_scope=$(git status --porcelain --untracked-files=all | cut -c4- | grep -v '^openspec/' || true)
           if [ -n "$out_of_scope" ]; then
-            echo "::error::Files changed outside openspec/ — leaving the branch as-is for inspection:"
+            echo "::error::Files changed outside openspec/:"
             echo "$out_of_scope"
+
+            # "Leave the branch for inspection" only means something if there's
+            # actually something pushed to look at — the runner's own filesystem is
+            # gone once the job ends. Push everything (including the offending files)
+            # so a human can see exactly what happened; this also marks the branch as
+            # having real content (ahead_by > 0), so it won't be auto-deleted as stale
+            # on a later retry the way an empty branch is.
+            git config user.name "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            git add -A
+            git commit -m "Scope violation for ${TICKET_ID} — left for inspection, not opened as a PR"
+            git push origin "poc/${TICKET_ID}"
+
             exit 1
           fi
 
