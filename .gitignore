@@ -165,3 +165,5 @@ apps/server-api/src/assets/icons/menu
 
 .claude/worktrees
 .claude/settings.local.json
+
+/test-results
