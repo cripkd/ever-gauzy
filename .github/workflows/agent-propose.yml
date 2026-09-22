@@ -26,8 +26,11 @@ name: Agent Propose
 #      locally via .git/info/exclude, never the tracked .gitignore — it must never be
 #      committed, and touching the tracked .gitignore would itself be a change outside
 #      openspec/).
-#   5. claude -p, --allowed-tools "Read,Write,Edit,Glob,Grep,Bash(openspec:*)", no MCP.
-#      Codebase exploration and file changes go through Read/Write/Edit/Glob/Grep —
+#   5. claude -p, model pinned via CLAUDE_MODEL (same repo variable as intake — an
+#      unpinned run defaulted to Opus here for a while, burning real credit on this
+#      token-heavy workflow before anyone could see why), --allowed-tools
+#      "Read,Write,Edit,Glob,Grep,Bash(openspec:*)", no MCP. Codebase exploration and
+#      file changes go through Read/Write/Edit/Glob/Grep —
 #      Bash is scoped to openspec:* only, since driving the openspec CLI is the one
 #      thing here that genuinely needs a shell (matching this repo's own reference
 #      openspec-propose/openspec-apply-change skills, which scope the same way).
@@ -66,6 +69,14 @@ permissions:
 
 env:
   TICKET_ID: ${{ github.event.client_payload.ticket_id }}
+  # Pinned rather than left to the CLI's built-in default: agent-intake.yml already
+  # learned this the hard way (an unpinned default is unverifiable from a personal
+  # machine and can change silently). This file never got the same fix when it was
+  # built afterward — the gap ran every propose invocation on the CLI's default
+  # model with no --model flag at all, which turned out to be Opus, not Sonnet, and
+  # burned real credit fast on this token-heavy, tool-call-heavy workflow. Same repo
+  # variable as intake, so no new setup needed.
+  CLAUDE_MODEL: ${{ vars.CLAUDE_MODEL }}
 
 jobs:
   propose:
@@ -286,6 +297,8 @@ jobs:
 
           prompt="$(cat prompts/propose.md)"
           output_file="${RUNNER_TEMP}/claude-output.txt"
+          model="${CLAUDE_MODEL:-claude-sonnet-5}"
+          echo "Using model: ${model}"
 
           # `|| claude_exit=$?`, not a bare call: under set -e a failing claude would
           # otherwise abort the step on this line, before `cat "$output_file"` below
@@ -294,6 +307,7 @@ jobs:
           # stdout-only, so claude's own error text never reached the log either.
           claude_exit=0
           claude -p "$prompt" \
+            --model "$model" \
             --allowed-tools "Read,Write,Edit,Glob,Grep,Bash(openspec:*)" \
             > "$output_file" 2>&1 || claude_exit=$?
 
