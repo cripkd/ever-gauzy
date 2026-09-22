@@ -178,11 +178,17 @@ jobs:
 
           if [ "$http_code" -lt 200 ] || [ "$http_code" -ge 300 ]; then
             if [ "$http_code" -eq 422 ]; then
-              echo "::error::Could not create branch ${branch} (HTTP 422) — it has unmerged work and needs manual attention."
+              reason="Could not create branch ${branch} (HTTP 422) — it has unmerged work and needs manual attention."
             else
-              echo "::error::Could not create branch ${branch} (HTTP ${http_code})."
+              reason="Could not create branch ${branch} (HTTP ${http_code})."
             fi
+            echo "::error::${reason}"
             cat "${RUNNER_TEMP}/branch-response.json"
+            {
+              echo "$reason"
+              echo
+              cat "${RUNNER_TEMP}/branch-response.json"
+            } > "${RUNNER_TEMP}/failure-reason.txt"
             exit 1
           fi
 
@@ -214,6 +220,11 @@ jobs:
           if [ "$http_code" -lt 200 ] || [ "$http_code" -ge 300 ]; then
             echo "::error::ClickUp GET task returned HTTP ${http_code}"
             cat "$task_json"
+            {
+              echo "ClickUp GET task returned HTTP ${http_code}."
+              echo
+              cat "$task_json"
+            } > "${RUNNER_TEMP}/failure-reason.txt"
             exit 1
           fi
 
@@ -265,11 +276,27 @@ jobs:
           prompt="$(cat prompts/propose.md)"
           output_file="${RUNNER_TEMP}/claude-output.txt"
 
+          # `|| claude_exit=$?`, not a bare call: under set -e a failing claude would
+          # otherwise abort the step on this line, before `cat "$output_file"` below
+          # ever runs — meaning a claude crash produced literally zero diagnostic
+          # output anywhere, not in the log and not in the reason file. Also 2>&1: was
+          # stdout-only, so claude's own error text never reached the log either.
+          claude_exit=0
           claude -p "$prompt" \
             --allowed-tools "Read,Write,Edit,Glob,Grep,Bash(openspec:*)" \
-            > "$output_file"
+            > "$output_file" 2>&1 || claude_exit=$?
 
           cat "$output_file"
+
+          if [ "$claude_exit" -ne 0 ]; then
+            echo "::error::claude exited with status ${claude_exit}"
+            {
+              echo "claude exited with status ${claude_exit}."
+              echo
+              tail -c 2000 "$output_file"
+            } > "${RUNNER_TEMP}/failure-reason.txt"
+            exit "$claude_exit"
+          fi
 
           result=$(grep -m1 '^RESULT:' "$output_file" | sed 's/^RESULT: *//')
           echo "result=${result}" >> "$GITHUB_OUTPUT"
@@ -287,6 +314,11 @@ jobs:
           if [ -n "$out_of_scope" ]; then
             echo "::error::Files changed outside openspec/:"
             echo "$out_of_scope"
+            {
+              echo "Files changed outside openspec/ (pushed to the branch for inspection):"
+              echo
+              echo "$out_of_scope"
+            } > "${RUNNER_TEMP}/failure-reason.txt"
 
             # "Leave the branch for inspection" only means something if there's
             # actually something pushed to look at — the runner's own filesystem is
@@ -331,6 +363,11 @@ jobs:
           if [ "$http_code" -lt 200 ] || [ "$http_code" -ge 300 ]; then
             echo "::error::ClickUp PUT status (revert to in spec) returned HTTP ${http_code}"
             cat "${RUNNER_TEMP}/revert-response.json"
+            {
+              echo "ClickUp PUT status (revert to in spec) returned HTTP ${http_code}."
+              echo
+              cat "${RUNNER_TEMP}/revert-response.json"
+            } > "${RUNNER_TEMP}/failure-reason.txt"
             exit 1
           fi
 
@@ -350,6 +387,11 @@ jobs:
           if [ "$http_code" -lt 200 ] || [ "$http_code" -ge 300 ]; then
             echo "::error::ClickUp POST comment returned HTTP ${http_code}"
             cat "${RUNNER_TEMP}/comment-response.json"
+            {
+              echo "ClickUp POST comment (insufficient-detail explanation) returned HTTP ${http_code}."
+              echo
+              cat "${RUNNER_TEMP}/comment-response.json"
+            } > "${RUNNER_TEMP}/failure-reason.txt"
             exit 1
           fi
 
@@ -357,30 +399,71 @@ jobs:
 
       - name: Validate the proposal
         if: steps.agent.outputs.result != 'insufficient-detail'
-        # --changes, not just --strict: bare `openspec validate --strict` returns
-        # "Nothing to validate" (exit 1) with no target — verified locally, it doesn't
-        # default to validating everything. --changes covers it without needing to know
-        # Claude's dynamically-chosen change name.
-        run: openspec validate --changes --strict
+        run: |
+          set -uo pipefail
+
+          # --changes, not just --strict: bare `openspec validate --strict` returns
+          # "Nothing to validate" (exit 1) with no target — verified locally, it
+          # doesn't default to validating everything. --changes covers it without
+          # needing to know Claude's dynamically-chosen change name.
+          output_file="${RUNNER_TEMP}/validate-output.txt"
+          validate_exit=0
+          openspec validate --changes --strict > "$output_file" 2>&1 || validate_exit=$?
+
+          cat "$output_file"
+
+          if [ "$validate_exit" -ne 0 ]; then
+            {
+              echo "openspec validate --changes --strict failed:"
+              echo
+              cat "$output_file"
+            } > "${RUNNER_TEMP}/failure-reason.txt"
+            exit "$validate_exit"
+          fi
 
       - name: Commit, push, and open the draft PR
         if: steps.agent.outputs.result != 'insufficient-detail'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          set -euo pipefail
+          set -uo pipefail
+
+          # Each command's own name and output go into the reason file only if it's
+          # the one that actually failed — `run_step` isolates which command that was,
+          # since this chains three commands that can each fail for unrelated reasons
+          # (nothing to commit, a push conflict, PR creation permissions).
+          run_step() {
+            local label="$1"
+            shift
+            local output code
+            # Capture $? immediately after the substitution, not via `if ! ...; then`
+            # — `!` negates the status for the if-test, so $? inside that branch would
+            # be the negation's own (always 0), not the real command's exit code.
+            output=$("$@" 2>&1)
+            code=$?
+            if [ "$code" -ne 0 ]; then
+              echo "$output"
+              {
+                echo "${label} failed:"
+                echo
+                echo "$output"
+              } > "${RUNNER_TEMP}/failure-reason.txt"
+              exit "$code"
+            fi
+            echo "$output"
+          }
 
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
-          git add openspec/
-          git commit -m "Propose spec for ${TICKET_ID}"
-          git push origin "poc/${TICKET_ID}"
+          run_step "git add" git add openspec/
+          run_step "git commit" git commit -m "Propose spec for ${TICKET_ID}"
+          run_step "git push" git push origin "poc/${TICKET_ID}"
 
           title="[${TICKET_ID}] ${TICKET_TITLE}"
           body="Proposes a spec for https://app.clickup.com/t/${TICKET_ID}"
 
-          gh pr create --draft --title "$title" --body "$body" --head "poc/${TICKET_ID}"
+          run_step "gh pr create" gh pr create --draft --title "$title" --body "$body" --head "poc/${TICKET_ID}"
 
       - name: On failure after the lock, flag for a human
         if: failure() && steps.lock.outcome == 'success'
@@ -389,13 +472,25 @@ jobs:
           CLICKUP_API_TOKEN: ${{ secrets.CLICKUP_API_TOKEN }}
         run: |
           run_url="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          reason_file="${RUNNER_TEMP}/failure-reason.txt"
+
+          # Every explicit failure point in this job writes a specific reason here
+          # before exiting. This falls back to a generic message only for something
+          # that fails in a way none of those sites anticipated.
+          if [ -f "$reason_file" ]; then
+            reason=$(head -c 2500 "$reason_file")
+          else
+            reason="(no specific reason was captured for this failure — check the run log)"
+          fi
 
           curl -sS -o /dev/null -w 'tag: %{http_code}\n' \
             -X POST \
             -H "Authorization: ${CLICKUP_API_TOKEN}" \
             "https://api.clickup.com/api/v2/task/${TICKET_ID}/tag/needs-human"
 
-          comment_payload=$(jq -n --arg t "Automated spec proposal failed. Run: ${run_url}" '{comment_text: $t, notify_all: false}')
+          comment_text=$(printf 'Automated spec proposal failed.\n\n%s\n\nRun: %s' "$reason" "$run_url")
+
+          comment_payload=$(jq -n --arg t "$comment_text" '{comment_text: $t, notify_all: false}')
           curl -sS -o /dev/null -w 'comment: %{http_code}\n' \
             -X POST \
             -H "Authorization: ${CLICKUP_API_TOKEN}" \
