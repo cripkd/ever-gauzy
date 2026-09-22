@@ -122,11 +122,29 @@ jobs:
               -d "$(jq -n --arg ref "refs/heads/${branch}" --arg sha "$sha" '{ref: $ref, sha: $sha}')"
           }
 
+          # Retry once on anything that isn't a clean success or the expected "already
+          # exists" (422, handled explicitly below). Observed in practice: GITHUB_TOKEN
+          # (unlike a real PAT, verified locally against the same repo) can return 403
+          # "Resource not accessible by integration" on a ref-creation call with
+          # contents: write already granted and confirmed for the run — transient, gone
+          # on a second attempt. A genuine permissions/config problem still surfaces
+          # after this, just one attempt later.
+          create_branch_retrying() {
+            local code
+            code=$(create_branch)
+            if [ "$code" -ge 300 ] && [ "$code" != "422" ]; then
+              echo "::warning::branch creation returned HTTP ${code} — retrying once" >&2
+              sleep 3
+              code=$(create_branch)
+            fi
+            echo "$code"
+          }
+
           # The git ref-creation API is atomic: 422 if the ref already exists. A plain
           # `git push` of a brand-new local branch would silently succeed even if the
           # branch already exists remotely at this exact commit (a no-op fast-forward,
           # not an error), which would defeat "exit if it already exists" entirely.
-          http_code=$(create_branch)
+          http_code=$(create_branch_retrying)
 
           if [ "$http_code" -eq 422 ]; then
             # Already exists — but a run that failed before ever committing (e.g. a
@@ -149,12 +167,21 @@ jobs:
                 -H "Accept: application/vnd.github+json" \
                 "${api}/git/refs/heads/${branch}"
 
-              http_code=$(create_branch)
+              # A brief pause before recreating: the 403 above was observed happening
+              # right after a delete of the same ref name, which a real PAT didn't
+              # reproduce — this and the retry in create_branch_retrying are cheap
+              # insurance against whatever timing/identity quirk causes it.
+              sleep 2
+              http_code=$(create_branch_retrying)
             fi
           fi
 
           if [ "$http_code" -lt 200 ] || [ "$http_code" -ge 300 ]; then
-            echo "::error::Could not create branch ${branch} (HTTP ${http_code}) — it has unmerged work and needs manual attention."
+            if [ "$http_code" -eq 422 ]; then
+              echo "::error::Could not create branch ${branch} (HTTP 422) — it has unmerged work and needs manual attention."
+            else
+              echo "::error::Could not create branch ${branch} (HTTP ${http_code})."
+            fi
             cat "${RUNNER_TEMP}/branch-response.json"
             exit 1
           fi
