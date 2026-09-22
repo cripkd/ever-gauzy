@@ -113,13 +113,19 @@ jobs:
           api="https://api.github.com/repos/${{ github.repository }}"
 
           create_branch() {
+            # || true: makes this function always return 0, so every call site that
+            # does `code=$(create_branch)` — a bare assignment, not exempt from the
+            # externally-active `bash -e` the way `cmd || fallback` is — can't be
+            # killed by a genuine network-level curl failure before it gets to look
+            # at the captured status. curl's own -w already writes "000" for that case.
             curl -sS -o "${RUNNER_TEMP}/branch-response.json" -w '%{http_code}' \
               -X POST \
               -H "Authorization: Bearer ${GH_API_TOKEN}" \
               -H "Accept: application/vnd.github+json" \
               -H "X-GitHub-Api-Version: 2022-11-28" \
               "${api}/git/refs" \
-              -d "$(jq -n --arg ref "refs/heads/${branch}" --arg sha "$sha" '{ref: $ref, sha: $sha}')"
+              -d "$(jq -n --arg ref "refs/heads/${branch}" --arg sha "$sha" '{ref: $ref, sha: $sha}')" \
+              || true
           }
 
           # Retry once on anything that isn't a clean success or the expected "already
@@ -157,7 +163,7 @@ jobs:
             ahead_by=$(curl -sS -H "Authorization: Bearer ${GH_API_TOKEN}" \
               -H "Accept: application/vnd.github+json" \
               "${api}/compare/${{ github.event.repository.default_branch }}...${branch}" \
-              | jq '.ahead_by')
+              | jq '.ahead_by' || true)
 
             if [ "$ahead_by" = "0" ]; then
               echo "poc/${TICKET_ID} exists but is empty (ahead_by 0) — deleting and recreating."
@@ -213,9 +219,14 @@ jobs:
 
           task_json="${RUNNER_TEMP}/task.json"
 
+          # || true: a bare assignment here would die silently under bash -e (GitHub
+          # Actions' always-on shell flag) on a genuine network-level curl failure,
+          # before the http_code check below ever runs — same class of bug found and
+          # fixed in run_step. curl's own -w already writes "000" on connection
+          # failure; || true just stops that from also killing the assignment.
           http_code=$(curl -sS -o "$task_json" -w '%{http_code}' \
             -H "Authorization: ${CLICKUP_API_TOKEN}" \
-            "https://api.clickup.com/api/v2/task/${TICKET_ID}")
+            "https://api.clickup.com/api/v2/task/${TICKET_ID}" || true)
 
           if [ "$http_code" -lt 200 ] || [ "$http_code" -ge 300 ]; then
             echo "::error::ClickUp GET task returned HTTP ${http_code}"
@@ -358,7 +369,7 @@ jobs:
             -H "Authorization: ${CLICKUP_API_TOKEN}" \
             -H "Content-Type: application/json" \
             "https://api.clickup.com/api/v2/task/${TICKET_ID}" \
-            -d "$status_payload")
+            -d "$status_payload" || true)
 
           if [ "$http_code" -lt 200 ] || [ "$http_code" -ge 300 ]; then
             echo "::error::ClickUp PUT status (revert to in spec) returned HTTP ${http_code}"
@@ -382,7 +393,7 @@ jobs:
             -H "Authorization: ${CLICKUP_API_TOKEN}" \
             -H "Content-Type: application/json" \
             "https://api.clickup.com/api/v2/task/${TICKET_ID}/comment" \
-            -d "$comment_payload")
+            -d "$comment_payload" || true)
 
           if [ "$http_code" -lt 200 ] || [ "$http_code" -ge 300 ]; then
             echo "::error::ClickUp POST comment returned HTTP ${http_code}"
@@ -436,11 +447,18 @@ jobs:
             local label="$1"
             shift
             local output code
-            # Capture $? immediately after the substitution, not via `if ! ...; then`
-            # — `!` negates the status for the if-test, so $? inside that branch would
-            # be the negation's own (always 0), not the real command's exit code.
-            output=$("$@" 2>&1)
-            code=$?
+            # `&& code=0 || code=$?`, not a bare `output=$(...)` followed by
+            # `code=$?`: GitHub Actions always runs steps as `bash -e {0}` — that -e
+            # is active from OUTSIDE this script regardless of any `set` command
+            # inside it, and a bare command-substitution assignment is NOT exempt
+            # from it the way `cmd || fallback` is. When gh pr create genuinely
+            # failed in production, this bare form killed the step on this exact
+            # line — before code=$? or any of the error-handling below ever ran,
+            # which is why the first real failure here produced zero diagnostics
+            # anywhere. Verified: reproduced the silent death under `bash -e`
+            # against a real failing command, then verified this form survives it
+            # and correctly reaches the error handling with the right exit code.
+            output=$("$@" 2>&1) && code=0 || code=$?
             if [ "$code" -ne 0 ]; then
               echo "$output"
               {
@@ -483,10 +501,14 @@ jobs:
             reason="(no specific reason was captured for this failure — check the run log)"
           fi
 
+          # || true on both: this step is best-effort in both directions — tag AND
+          # comment should each be attempted regardless of whether the other one
+          # succeeds, and a bare failing curl here would otherwise abort the script
+          # under bash -e before the second one ever ran.
           curl -sS -o /dev/null -w 'tag: %{http_code}\n' \
             -X POST \
             -H "Authorization: ${CLICKUP_API_TOKEN}" \
-            "https://api.clickup.com/api/v2/task/${TICKET_ID}/tag/needs-human"
+            "https://api.clickup.com/api/v2/task/${TICKET_ID}/tag/needs-human" || true
 
           comment_text=$(printf 'Automated spec proposal failed.\n\n%s\n\nRun: %s' "$reason" "$run_url")
 
@@ -496,4 +518,4 @@ jobs:
             -H "Authorization: ${CLICKUP_API_TOKEN}" \
             -H "Content-Type: application/json" \
             "https://api.clickup.com/api/v2/task/${TICKET_ID}/comment" \
-            -d "$comment_payload"
+            -d "$comment_payload" || true
