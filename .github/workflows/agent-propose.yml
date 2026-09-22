@@ -284,7 +284,12 @@ jobs:
             exit 1
           fi
 
-          comment_payload=$(jq -n --arg t "$comment_text" '{comment_text: $t, notify_all: false}')
+          # comment, not comment_text: comment_source is real markdown (headings,
+          # bullets, inline code from proposal.md), and comment_text stores it as
+          # literal syntax characters instead of formatting it. Verified against a live
+          # task: the comment block array is what actually gets it rendered.
+          comment_blocks=$(printf '%s' "$comment_text" | node .github/scripts/markdown-to-clickup-comment.mjs)
+          comment_payload=$(jq -n --argjson c "$comment_blocks" '{comment: $c, notify_all: false}')
           http_code=$(curl -sS -o "${RUNNER_TEMP}/comment-response.json" -w '%{http_code}' \
             -X POST \
             -H "Authorization: ${CLICKUP_API_TOKEN}" \
