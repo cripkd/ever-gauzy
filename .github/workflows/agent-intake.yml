@@ -262,7 +262,11 @@ jobs:
           # sed '$d' (POSIX), not `head -n -1`: negative counts are a GNU-only extension.
           sed '$d' rewritten.md > description.txt
 
-          payload=$(jq -n --rawfile v description.txt '{description: $v}')
+          # markdown_content, not description: rewritten.md is real markdown (headings,
+          # checklists, bold), and the plain `description` field renders it as literal
+          # syntax characters instead of interpreting it. Verified against a live task —
+          # markdown_content is what actually gets ClickUp to render it.
+          payload=$(jq -n --rawfile v description.txt '{markdown_content: $v}')
 
           http_code=$(curl -sS -o update-response.json -w '%{http_code}' \
             -X PUT \
