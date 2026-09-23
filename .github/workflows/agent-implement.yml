@@ -114,6 +114,19 @@ jobs:
         with:
           fetch-depth: 0
 
+      - name: Capture the implement prompt
+        # Must happen BEFORE the branch switch below, and land outside the repo checkout
+        # (RUNNER_TEMP, not a repo-relative path): prompts/implement.md lives on develop
+        # (this is the ref actions/checkout just fetched, for a repository_dispatch run),
+        # not necessarily on poc/<ticket_id> — that branch is whatever agent-propose.yml
+        # committed at propose-time, which can predate any later addition or edit to this
+        # file on develop. `git checkout -B` two steps from now is a full ref switch: it
+        # deletes any tracked file the target branch doesn't have. Reading the prompt
+        # from a path inside the repo AFTER that switch would silently read whatever
+        # (possibly nonexistent, possibly stale) version poc/<ticket_id> happens to carry,
+        # instead of the pipeline's actual current contract.
+        run: cp prompts/implement.md "${RUNNER_TEMP}/implement-prompt.md"
+
       - name: Check out the existing implementation branch
         run: |
           set -euo pipefail
@@ -254,7 +267,10 @@ jobs:
         run: |
           set -euo pipefail
 
-          prompt="$(cat prompts/implement.md)"
+          # From RUNNER_TEMP, not the repo-relative path — see the "Capture the implement
+          # prompt" step's comment for why: the repo working tree has since been switched
+          # to poc/${TICKET_ID}, which may not carry this file (or the current version of it).
+          prompt="$(cat "${RUNNER_TEMP}/implement-prompt.md")"
           output_file="${RUNNER_TEMP}/claude-output.txt"
           model="${CLAUDE_MODEL:-claude-sonnet-5}"
           echo "Using model: ${model}"
