@@ -1,0 +1,526 @@
+name: Agent Implement
+
+# Fires once per clickup-implement dispatch from poll-clickup-implement.yml. Executes an
+# already-approved OpenSpec change's tasks.md against the real codebase, on the same
+# poc/<ticket_id> branch and draft PR agent-propose.yml created, and pushes the result so
+# that PR is ready for human review. See prompts/implement.md for Claude's exact contract.
+#
+# Flow:
+#   1. PUT status -> in progress. FIRST action, before checkout. Dispatch lock, same
+#      reasoning as agent-propose.yml: poll-clickup-implement.yml only ever queries
+#      statuses[]=ready%20for%20dev, so a ticket moved out of that status can't be
+#      re-dispatched by a later poll cycle.
+#   2. Full checkout (fetch-depth: 0), then fetch + check out the EXISTING poc/<ticket_id>
+#      branch (unlike propose, this workflow never creates a branch — a ticket can't reach
+#      "ready for dev" without having gone through propose first, so the branch and its
+#      draft PR must already exist; if the fetch fails, that's a real error).
+#   3. Install Claude Code and the openspec CLI, then restore node_modules — this workflow
+#      DOES touch application code, unlike propose, so (unlike propose) it needs the full
+#      dependency tree. Reuses poc-e2e.yml's own restore/archive scripts and exact cache
+#      key formula, so a cache poc-e2e.yml already populated is reused here too (this
+#      workflow never changes dependencies, so a hit there is a hit here).
+#   4. Resolve the one OpenSpec change living on this branch via `openspec list --json` —
+#      require exactly one. Write its name to .change-name (git-ignored locally, same
+#      .git/info/exclude trick as ticket.md) for the prompt to read.
+#   5. Write the ticket's description to ticket.md (git-ignored locally), same pattern as
+#      propose — supplementary context; the OpenSpec artifacts are authoritative.
+#   6. claude -p, model pinned via CLAUDE_MODEL, --allowed-tools
+#      "Read,Write,Edit,Glob,Grep,Bash(openspec:*)" — same scope as propose. Claude
+#      implements every task in tasks.md and marks it complete; it does not commit, push,
+#      run tests, touch the PR, or run openspec archive — the workflow does all of that.
+#      Notably absent from --allowed-tools: Plan Mode. There's no human here to approve a
+#      plan, and the plan already exists (tasks.md itself, an already-approved artifact)
+#      — Claude's job is to execute it, not draft a new one.
+#   7. RESULT: blocked -> same shape as agent-propose.yml's insufficient-detail path: push
+#      whatever real progress exists (for inspection), revert status back to "ready for
+#      dev", tag "needs-human" AND "implement-blocked", comment with the reason. This is a
+#      clean, successful completion of the job (no exit 1) — a blocked run is the agent
+#      correctly refusing to guess, not a crash. The "implement-blocked" tag is what keeps
+#      the revert-to-"ready for dev" safe: poll-clickup-implement.yml skips any task
+#      carrying it, so this ticket won't be immediately re-dispatched into the same
+#      blocker on the next poll cycle — it only becomes pollable again once a human
+#      removes the tag (both tags must already exist in the ClickUp Space; unlike
+#      "needs-human", "implement-blocked" is new and must be created there once, manually,
+#      before this workflow's first blocked run).
+#      RESULT: implemented -> self-check (nx affected lint/typecheck/build) before pushing;
+#      a self-check failure IS treated as a real failure (tag "needs-human", generic
+#      catch-all below) — unlike "blocked", the agent believed it was done and wasn't.
+#      Only a clean self-check leads to commit + push + `gh pr ready` (undraft).
+#   8. Any failure from step 2 onward: tag "needs human" + comment with the run URL, same
+#      generic catch-all as agent-propose.yml.
+
+on:
+  repository_dispatch:
+    types: [clickup-implement]
+  workflow_dispatch:
+    inputs:
+      ticket_id:
+        description: ClickUp ticket id (for a manual re-run after a blocked/failed run)
+        required: true
+
+concurrency:
+  group: agent-implement-${{ github.event.client_payload.ticket_id || inputs.ticket_id }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  pull-requests: write
+
+env:
+  TICKET_ID: ${{ github.event.client_payload.ticket_id || inputs.ticket_id }}
+  # Same repo variable agent-propose.yml and agent-intake.yml already pin this to — an
+  # unpinned run defaults to a different model entirely (see agent-propose.yml's own
+  # comment on this), which is exactly what this pipeline pins everything against.
+  CLAUDE_MODEL: ${{ vars.CLAUDE_MODEL }}
+  # Same filename poc-e2e.yml uses for its own archive/cache — deliberately, so this
+  # workflow reuses that workflow's cache entry rather than maintaining a second one.
+  NODE_MODULES_ARCHIVE: node-modules.tar.zst
+  # Nx Cloud is disabled for this org; without this, any nx invocation hard-fails with
+  # "Nx Cloud: Workspace is unable to be authorized. Exiting run." (same as poc-e2e.yml).
+  NX_NO_CLOUD: true
+
+jobs:
+  implement:
+    name: Implement the approved spec for a ticket
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: Move task to in progress (dispatch lock)
+        id: lock
+        env:
+          CLICKUP_API_TOKEN: ${{ secrets.CLICKUP_API_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          payload=$(jq -n '{status: "in progress"}')
+
+          http_code=$(curl -sS -o "${RUNNER_TEMP}/lock-response.json" -w '%{http_code}' \
+            -X PUT \
+            -H "Authorization: ${CLICKUP_API_TOKEN}" \
+            -H "Content-Type: application/json" \
+            "https://api.clickup.com/api/v2/task/${TICKET_ID}" \
+            -d "$payload")
+
+          if [ "$http_code" -lt 200 ] || [ "$http_code" -ge 300 ]; then
+            echo "::error::ClickUp PUT status returned HTTP ${http_code} — could not acquire the dispatch lock, stopping."
+            cat "${RUNNER_TEMP}/lock-response.json"
+            exit 1
+          fi
+
+          echo "Ticket ${TICKET_ID}: moved to \"in progress\"."
+
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Check out the existing implementation branch
+        run: |
+          set -euo pipefail
+
+          branch="poc/${TICKET_ID}"
+
+          # Unlike agent-propose.yml, this branch is never created here — a ticket can't
+          # reach "ready for dev" without already having gone through propose, which
+          # creates poc/<ticket_id> and its draft PR. A missing branch means the ticket
+          # got moved to "ready for dev" some other way; that's a real problem, not
+          # something to silently paper over by creating a fresh empty branch.
+          if ! git fetch origin "$branch"; then
+            reason="Branch ${branch} does not exist on origin — this ticket reached \"ready for dev\" without ever going through the propose stage (or the branch was deleted since). Nothing to implement against."
+            echo "::error::${reason}"
+            echo "$reason" > "${RUNNER_TEMP}/failure-reason.txt"
+            exit 1
+          fi
+
+          git checkout -B "$branch" "origin/$branch"
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: Install the Claude Code and openspec CLIs
+        run: |
+          npm install -g @anthropic-ai/claude-code
+          npm install -g @fission-ai/openspec
+
+      - name: Restore node_modules archive
+        id: node-modules-cache
+        uses: actions/cache/restore@v4
+        # Same key formula as poc-e2e.yml, deliberately — see the header comment. A miss
+        # here just means poc-e2e.yml hasn't run since the lockfile last changed; the
+        # fallback bootstrap below still works, just slower (1-3h, per the script itself).
+        with:
+          path: ${{ env.NODE_MODULES_ARCHIVE }}
+          key: ${{ runner.os }}-${{ runner.arch }}-node-modules-${{ hashFiles('yarn.lock', 'package.json', 'patches/**', '.scripts/postinstall.js') }}
+
+      - name: Restore node_modules
+        shell: bash
+        run: .github/scripts/restore-node-modules.sh
+
+      - name: Archive node_modules
+        if: steps.node-modules-cache.outputs.cache-hit != 'true'
+        shell: bash
+        run: .github/scripts/archive-node-modules.sh
+
+      - name: Save node_modules archive
+        if: steps.node-modules-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        continue-on-error: true
+        with:
+          path: ${{ env.NODE_MODULES_ARCHIVE }}
+          key: ${{ steps.node-modules-cache.outputs.cache-primary-key }}
+
+      - name: Resolve the OpenSpec change
+        run: |
+          set -euo pipefail
+
+          list_json="${RUNNER_TEMP}/openspec-list.json"
+          if ! openspec list --json > "$list_json" 2> "${RUNNER_TEMP}/openspec-list.err"; then
+            reason="openspec list --json failed:
+          $(cat "${RUNNER_TEMP}/openspec-list.err")"
+            echo "::error::${reason}"
+            echo "$reason" > "${RUNNER_TEMP}/failure-reason.txt"
+            exit 1
+          fi
+
+          count=$(jq '.changes | length' "$list_json")
+          if [ "$count" -ne 1 ]; then
+            reason="Expected exactly one active OpenSpec change on poc/${TICKET_ID}, found ${count}:
+          $(jq -r '.changes[].name' "$list_json")"
+            echo "::error::${reason}"
+            echo "$reason" > "${RUNNER_TEMP}/failure-reason.txt"
+            exit 1
+          fi
+
+          change_name=$(jq -r '.changes[0].name' "$list_json")
+          echo "Resolved OpenSpec change: ${change_name}"
+          echo "$change_name" > .change-name
+
+          # Locally ignored, not via the tracked .gitignore — same reasoning as ticket.md
+          # below: this file must never be committed, and it's per-run derived state, not
+          # something a human editing the repo needs to see.
+          echo ".change-name" >> .git/info/exclude
+
+      - name: Write the ticket to ticket.md
+        env:
+          CLICKUP_API_TOKEN: ${{ secrets.CLICKUP_API_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          task_json="${RUNNER_TEMP}/task.json"
+
+          http_code=$(curl -sS -o "$task_json" -w '%{http_code}' \
+            -H "Authorization: ${CLICKUP_API_TOKEN}" \
+            "https://api.clickup.com/api/v2/task/${TICKET_ID}" || true)
+
+          if [ "$http_code" -lt 200 ] || [ "$http_code" -ge 300 ]; then
+            echo "::error::ClickUp GET task returned HTTP ${http_code}"
+            cat "$task_json"
+            {
+              echo "ClickUp GET task returned HTTP ${http_code}."
+              echo
+              cat "$task_json"
+            } > "${RUNNER_TEMP}/failure-reason.txt"
+            exit 1
+          fi
+
+          jq -r '.description // ""' "$task_json" > ticket.md
+          echo "ticket.md" >> .git/info/exclude
+
+      - name: Trust the workspace for Claude Code
+        run: |
+          set -euo pipefail
+
+          # See agent-propose.yml's identical step for why this exact form is required —
+          # Claude Code gates a repo's own .claude/settings.local.json behind a one-time
+          # interactive trust dialog with no CLI flag to grant it.
+          real_path=$(pwd -P)
+          claude_config="${HOME}/.claude.json"
+
+          existing='{}'
+          if [ -f "$claude_config" ]; then
+            existing=$(cat "$claude_config")
+          fi
+
+          printf '%s' "$existing" \
+            | jq --arg path "$real_path" '.projects[$path].hasTrustDialogAccepted = true' \
+            > "$claude_config"
+
+      - name: Run the implement agent
+        id: agent
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          set -euo pipefail
+
+          prompt="$(cat prompts/implement.md)"
+          output_file="${RUNNER_TEMP}/claude-output.txt"
+          model="${CLAUDE_MODEL:-claude-sonnet-5}"
+          echo "Using model: ${model}"
+
+          claude_exit=0
+          claude -p "$prompt" \
+            --model "$model" \
+            --allowed-tools "Read,Write,Edit,Glob,Grep,Bash(openspec:*)" \
+            > "$output_file" 2>&1 || claude_exit=$?
+
+          cat "$output_file"
+
+          if [ "$claude_exit" -ne 0 ]; then
+            echo "::error::claude exited with status ${claude_exit}"
+            {
+              echo "claude exited with status ${claude_exit}."
+              echo
+              tail -c 2000 "$output_file"
+            } > "${RUNNER_TEMP}/failure-reason.txt"
+            exit "$claude_exit"
+          fi
+
+          # `|| true` on both: under pipefail, `grep | sed` fails the whole pipeline if
+          # grep finds no match (no RESULT:/TASKS: line — a real possibility if Claude's
+          # final output ever goes off-contract), and a bare assignment on that failure
+          # would abort the script right here under the externally active `bash -e` —
+          # before EITHER $GITHUB_OUTPUT line is written, discarding an already-parsed
+          # result too. Explicit non-empty check below turns that into a specific,
+          # diagnosable failure-reason.txt instead of falling through to the generic
+          # catch-all's "(no specific reason was captured)" fallback.
+          result=$(grep -m1 '^RESULT:' "$output_file" | sed 's/^RESULT: *//') || true
+          tasks=$(grep -m1 '^TASKS:' "$output_file" | sed 's/^TASKS: *//') || true
+
+          if [ -z "$result" ]; then
+            echo "::error::claude's output has no RESULT: line"
+            {
+              echo "claude's output has no RESULT: line — cannot determine outcome."
+              echo
+              tail -c 2000 "$output_file"
+            } > "${RUNNER_TEMP}/failure-reason.txt"
+            exit 1
+          fi
+
+          echo "result=${result}" >> "$GITHUB_OUTPUT"
+          echo "tasks=${tasks}" >> "$GITHUB_OUTPUT"
+
+      - name: Handle blocked result
+        if: steps.agent.outputs.result == 'blocked'
+        env:
+          CLICKUP_API_TOKEN: ${{ secrets.CLICKUP_API_TOKEN }}
+          # Passed through env and referenced as $TASKS below, not interpolated as
+          # ${{ steps.agent.outputs.tasks }} directly inside the script body: that value
+          # is parsed out of Claude's own free-text stdout (which is itself downstream of
+          # ticket/spec content CLAUDE.md already treats as untrusted input), and GitHub
+          # splices a `${{ }}` expression into the script's literal text before bash ever
+          # sees it — an unescaped `"` or `$(...)` on the TASKS: line would become
+          # executable shell in a job holding contents: write, pull-requests: write, and
+          # three API tokens. env: values don't have this problem; they're passed as
+          # actual process environment, not spliced into source text.
+          TASKS: ${{ steps.agent.outputs.tasks }}
+        run: |
+          set -uo pipefail
+
+          # "Push for inspection" only means something if something is actually pushed —
+          # same insight agent-propose.yml's scope-violation handler documents. Only
+          # commits if Claude actually changed something before stopping. The next
+          # implement run (once unblocked) checks out this same branch, so any progress
+          # made here — including tasks.md's updated checkboxes — carries forward.
+          if [ -n "$(git status --porcelain)" ]; then
+            git config user.name "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            git add -A
+            # `|| echo ...`, not bare: the status revert + tagging + comment below matter
+            # more than this WIP push succeeding, and a failure on either bare command
+            # here would otherwise abort the whole step right here under the externally
+            # active `bash -e` — silently skipping all of that.
+            git commit -m "WIP: ${TICKET_ID} — implementation blocked, left for inspection" \
+              || echo "::warning::nothing to commit, or commit failed — continuing"
+            git push origin "poc/${TICKET_ID}" \
+              || echo "::warning::push of WIP progress failed — continuing with status revert and tagging anyway"
+          fi
+
+          # Revert to "ready for dev" — same shape as agent-propose.yml reverting
+          # insufficient-detail tickets to "in spec". Safe here specifically because the
+          # "implement-blocked" tag below keeps poll-clickup-implement.yml from picking
+          # this ticket straight back up.
+          status_payload=$(jq -n '{status: "ready for dev"}')
+          http_code=$(curl -sS -o "${RUNNER_TEMP}/revert-response.json" -w '%{http_code}' \
+            -X PUT \
+            -H "Authorization: ${CLICKUP_API_TOKEN}" \
+            -H "Content-Type: application/json" \
+            "https://api.clickup.com/api/v2/task/${TICKET_ID}" \
+            -d "$status_payload" || true)
+
+          if [ "$http_code" -lt 200 ] || [ "$http_code" -ge 300 ]; then
+            echo "::error::ClickUp PUT status (revert to ready for dev) returned HTTP ${http_code}"
+            cat "${RUNNER_TEMP}/revert-response.json"
+            {
+              echo "ClickUp PUT status (revert to ready for dev) returned HTTP ${http_code}."
+              echo
+              cat "${RUNNER_TEMP}/revert-response.json"
+            } > "${RUNNER_TEMP}/failure-reason.txt"
+            exit 1
+          fi
+
+          # Both tags must already exist in the ClickUp Space — this call only attaches
+          # them to the task, it does not create them (verified against ClickUp's API
+          # docs: task-tag and space-tag are separate endpoints).
+          curl -sS -o /dev/null -w 'tag needs-human: %{http_code}\n' \
+            -X POST \
+            -H "Authorization: ${CLICKUP_API_TOKEN}" \
+            "https://api.clickup.com/api/v2/task/${TICKET_ID}/tag/needs-human" || true
+
+          curl -sS -o /dev/null -w 'tag implement-blocked: %{http_code}\n' \
+            -X POST \
+            -H "Authorization: ${CLICKUP_API_TOKEN}" \
+            "https://api.clickup.com/api/v2/task/${TICKET_ID}/tag/implement-blocked" || true
+
+          comment_text=$(printf 'Implementation blocked (%s tasks done) — reasoning below.\n\n%s' \
+            "$TASKS" \
+            "$(tail -c 3000 "${RUNNER_TEMP}/claude-output.txt")")
+
+          # comment, via the same markdown-to-clickup-comment.mjs conversion
+          # agent-propose.yml's insufficient-detail handler uses — Claude's own output is
+          # real markdown, and the comment block array is what actually renders it as
+          # such rather than literal syntax characters.
+          comment_blocks=$(printf '%s' "$comment_text" | node .github/scripts/markdown-to-clickup-comment.mjs)
+          comment_payload=$(jq -n --argjson c "$comment_blocks" '{comment: $c, notify_all: false}')
+          http_code=$(curl -sS -o "${RUNNER_TEMP}/comment-response.json" -w '%{http_code}' \
+            -X POST \
+            -H "Authorization: ${CLICKUP_API_TOKEN}" \
+            -H "Content-Type: application/json" \
+            "https://api.clickup.com/api/v2/task/${TICKET_ID}/comment" \
+            -d "$comment_payload" || true)
+
+          if [ "$http_code" -lt 200 ] || [ "$http_code" -ge 300 ]; then
+            echo "::error::ClickUp POST comment returned HTTP ${http_code}"
+            cat "${RUNNER_TEMP}/comment-response.json"
+            {
+              echo "ClickUp POST comment (blocked explanation) returned HTTP ${http_code}."
+              echo
+              cat "${RUNNER_TEMP}/comment-response.json"
+            } > "${RUNNER_TEMP}/failure-reason.txt"
+            exit 1
+          fi
+
+          echo "Ticket ${TICKET_ID}: implementation blocked — reverted to \"ready for dev\", tagged, commented."
+
+      - name: Self-check the implementation (lint, typecheck, build)
+        id: selfcheck
+        if: steps.agent.outputs.result == 'implemented'
+        run: |
+          set -uo pipefail
+
+          output_file="${RUNNER_TEMP}/selfcheck-output.txt"
+          # typecheck: no project in this workspace defines that target today, but nx
+          # affected silently no-ops a target nothing declares (verified locally) rather
+          # than failing — harmless to ask for now, and picks it up automatically the day
+          # a project does define it.
+          #
+          # `|| selfcheck_exit=$?`, not a bare assignment: GitHub Actions runs steps as
+          # `bash -e {0}` regardless of this script's own `set` line (see agent-propose.yml's
+          # extensive comments on this exact class of bug) — a bare
+          # `selfcheck_exit=$?` on the line after a failing command never gets reached,
+          # because the command itself already aborted the step under the externally
+          # active -e.
+          selfcheck_exit=0
+          npx nx affected --base=origin/${{ github.event.repository.default_branch }} \
+            --target=lint,typecheck,build > "$output_file" 2>&1 || selfcheck_exit=$?
+
+          cat "$output_file"
+
+          if [ "$selfcheck_exit" -ne 0 ]; then
+            echo "passed=false" >> "$GITHUB_OUTPUT"
+            {
+              echo "nx affected --target=lint,typecheck,build failed:"
+              echo
+              tail -c 3000 "$output_file"
+            } > "${RUNNER_TEMP}/failure-reason.txt"
+          else
+            echo "passed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Handle self-check failure
+        if: steps.agent.outputs.result == 'implemented' && steps.selfcheck.outputs.passed == 'false'
+        run: |
+          set -uo pipefail
+
+          if [ -n "$(git status --porcelain)" ]; then
+            git config user.name "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            git add -A
+            git commit -m "WIP: ${TICKET_ID} — implementation complete but self-check failed, left for inspection"
+            git push origin "poc/${TICKET_ID}"
+          fi
+
+          exit 1
+
+      - name: Commit, push, and mark the PR ready for review
+        if: steps.agent.outputs.result == 'implemented' && steps.selfcheck.outputs.passed == 'true'
+        # Deliberately does not clear a leftover "implement-blocked" tag from an earlier
+        # blocked run on this same ticket, even on a now-clean success: that tag's removal
+        # is the human's own unblock signal (see poll-clickup-implement.yml's header
+        # comment), not something this workflow infers from a later run merely completing.
+        env:
+          # DISPATCH_PAT, not GITHUB_TOKEN — same reasoning as agent-propose.yml's `gh pr
+          # create` step: this fork blocks GITHUB_TOKEN from PR operations regardless of
+          # default_workflow_permissions, confirmed there on a real run. `gh pr ready`
+          # is a PR operation too, so it needs the same real token.
+          GH_TOKEN: ${{ secrets.DISPATCH_PAT }}
+        run: |
+          set -uo pipefail
+
+          run_step() {
+            local label="$1"
+            shift
+            local output code
+            output=$("$@" 2>&1) && code=0 || code=$?
+            if [ "$code" -ne 0 ]; then
+              echo "$output"
+              {
+                echo "${label} failed:"
+                echo
+                echo "$output"
+              } > "${RUNNER_TEMP}/failure-reason.txt"
+              exit "$code"
+            fi
+            echo "$output"
+          }
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          run_step "git add" git add -A
+          run_step "git commit" git commit -m "Implement ${TICKET_ID}"
+          run_step "git push" git push origin "poc/${TICKET_ID}"
+          run_step "gh pr ready" gh pr ready "poc/${TICKET_ID}"
+
+          echo "Ticket ${TICKET_ID}: implementation pushed, PR marked ready for review."
+
+      - name: On failure after the lock, flag for a human
+        if: failure() && steps.lock.outcome == 'success'
+        continue-on-error: true
+        env:
+          CLICKUP_API_TOKEN: ${{ secrets.CLICKUP_API_TOKEN }}
+        run: |
+          run_url="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          reason_file="${RUNNER_TEMP}/failure-reason.txt"
+
+          if [ -f "$reason_file" ]; then
+            reason=$(head -c 2500 "$reason_file")
+          else
+            reason="(no specific reason was captured for this failure — check the run log)"
+          fi
+
+          curl -sS -o /dev/null -w 'tag: %{http_code}\n' \
+            -X POST \
+            -H "Authorization: ${CLICKUP_API_TOKEN}" \
+            "https://api.clickup.com/api/v2/task/${TICKET_ID}/tag/needs-human" || true
+
+          comment_text=$(printf 'Automated implementation failed.\n\n%s\n\nRun: %s' "$reason" "$run_url")
+
+          comment_payload=$(jq -n --arg t "$comment_text" '{comment_text: $t, notify_all: false}')
+          curl -sS -o /dev/null -w 'comment: %{http_code}\n' \
+            -X POST \
+            -H "Authorization: ${CLICKUP_API_TOKEN}" \
+            -H "Content-Type: application/json" \
+            "https://api.clickup.com/api/v2/task/${TICKET_ID}/comment" \
+            -d "$comment_payload" || true
