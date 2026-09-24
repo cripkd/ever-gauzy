@@ -457,32 +457,77 @@ jobs:
           set -uo pipefail
 
           output_file="${RUNNER_TEMP}/selfcheck-output.txt"
-          # typecheck: no project in this workspace defines that target today, but nx
-          # affected silently no-ops a target nothing declares (verified locally) rather
-          # than failing — harmless to ask for now, and picks it up automatically the day
-          # a project does define it.
+
+          # Scoped to the projects this ticket's own changed files directly belong to —
+          # NOT `nx affected`'s full dependent graph. Verified on a real run: touching one
+          # file in packages/core (46 dependent projects) plus one in packages/ui-core (30
+          # more) made `nx affected --target=lint,typecheck,build` try to lint and build 74
+          # projects in a single pass, which OOM'd outright on a standard GitHub-hosted
+          # runner — and even without crashing, it surfaced 141 pre-existing lint errors in
+          # files this ticket never touched (e.g. desktop-ui-lib components) as though they
+          # were this change's fault. Regression-catching across the dependent graph
+          # already has a home: pipeline-reference.md's stage 5, the accumulated e2e suite
+          # ("no separate regression gate — the accumulated suite IS the regression run").
+          # This self-check only needs to confirm what was actually written is clean, not
+          # re-derive the whole dependent graph a second time.
           #
-          # `|| selfcheck_exit=$?`, not a bare assignment: GitHub Actions runs steps as
-          # `bash -e {0}` regardless of this script's own `set` line (see agent-propose.yml's
-          # extensive comments on this exact class of bug) — a bare
-          # `selfcheck_exit=$?` on the line after a failing command never gets reached,
-          # because the command itself already aborted the step under the externally
-          # active -e.
-          selfcheck_exit=0
-          npx nx affected --base=origin/${{ github.event.repository.default_branch }} \
-            --target=lint,typecheck,build > "$output_file" 2>&1 || selfcheck_exit=$?
+          # Project resolution: walk up from each changed file to the nearest project.json
+          # ancestor. A file with none (e.g. anything under openspec/, which resolves only
+          # as far as the workspace root's own "ever-gauzy" pseudo-project) is harmless to
+          # include — that project defines no lint/typecheck/build target, and nx run-many
+          # silently no-ops a project missing a given target rather than failing (verified
+          # locally), same as it already does for the "no project defines typecheck yet"
+          # case below.
+          base_sha=$(git merge-base "origin/${{ github.event.repository.default_branch }}" HEAD)
+          projects=""
+          while IFS= read -r file; do
+            [ -z "$file" ] && continue
+            dir=$(dirname "$file")
+            while [ "$dir" != "." ] && [ ! -f "$dir/project.json" ]; do
+              dir=$(dirname "$dir")
+            done
+            if [ -f "$dir/project.json" ]; then
+              name=$(jq -r '.name' "$dir/project.json")
+              projects="${projects}${name}"$'\n'
+            fi
+          done < <(git diff --name-only "$base_sha" HEAD)
+          # `|| true`: grep -v exits 1 if every line is blank (the no-owning-project
+          # edge case, checked explicitly below) — a bare assignment here would otherwise
+          # abort the script under the externally active `bash -e` before that check ran.
+          projects=$(printf '%s' "$projects" | sort -u | grep -v '^$' | paste -sd, - || true)
 
-          cat "$output_file"
+          echo "Self-check scoped to: ${projects:-(no owning project found for any changed file — nothing to check)}"
 
-          if [ "$selfcheck_exit" -ne 0 ]; then
-            echo "passed=false" >> "$GITHUB_OUTPUT"
-            {
-              echo "nx affected --target=lint,typecheck,build failed:"
-              echo
-              tail -c 3000 "$output_file"
-            } > "${RUNNER_TEMP}/failure-reason.txt"
-          else
+          if [ -z "$projects" ]; then
             echo "passed=true" >> "$GITHUB_OUTPUT"
+          else
+            # typecheck: no project in this workspace defines that target today, but nx
+            # silently no-ops a target nothing declares (verified locally) rather than
+            # failing — harmless to ask for now, and picks it up automatically the day a
+            # project does define it.
+            #
+            # `|| selfcheck_exit=$?`, not a bare assignment: GitHub Actions runs steps as
+            # `bash -e {0}` regardless of this script's own `set` line (see
+            # agent-propose.yml's extensive comments on this exact class of bug) — a bare
+            # `selfcheck_exit=$?` on the line after a failing command never gets reached,
+            # because the command itself already aborted the step under the externally
+            # active -e.
+            selfcheck_exit=0
+            npx nx run-many --target=lint,typecheck,build --projects="$projects" \
+              > "$output_file" 2>&1 || selfcheck_exit=$?
+
+            cat "$output_file"
+
+            if [ "$selfcheck_exit" -ne 0 ]; then
+              echo "passed=false" >> "$GITHUB_OUTPUT"
+              {
+                echo "nx run-many --target=lint,typecheck,build --projects=${projects} failed:"
+                echo
+                tail -c 3000 "$output_file"
+              } > "${RUNNER_TEMP}/failure-reason.txt"
+            else
+              echo "passed=true" >> "$GITHUB_OUTPUT"
+            fi
           fi
 
       - name: Handle self-check failure
