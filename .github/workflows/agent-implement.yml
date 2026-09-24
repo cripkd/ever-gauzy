@@ -433,6 +433,25 @@ jobs:
               echo
               tail -c 2000 "$output_file"
             } > "${RUNNER_TEMP}/failure-reason.txt"
+
+            # Best-effort: capture whatever cost/session data IS available even on
+            # a failure — an API-level error (e.g. "credit balance too low")
+            # still returns a valid JSON result object with real cost already
+            # spent before erroring, confirmed on a real run ($1.33 spent, then
+            # failed). Losing that would be exactly the run a cost dashboard most
+            # needs to show. `|| true`: $output_file may not be valid JSON at all
+            # if claude crashed before producing any output.
+            jq -r '"CLAUDE_SESSION_ID=" + (.session_id // ""),
+                   "CLAUDE_MODEL_USED=" + ((.modelUsage // {}) | keys | last // ""),
+                   "CLAUDE_COST_USD=" + ((.total_cost_usd // "") | tostring),
+                   "CLAUDE_INPUT_TOKENS=" + ((.usage.input_tokens // "") | tostring),
+                   "CLAUDE_OUTPUT_TOKENS=" + ((.usage.output_tokens // "") | tostring),
+                   "CLAUDE_CACHE_READ_TOKENS=" + ((.usage.cache_read_input_tokens // "") | tostring),
+                   "CLAUDE_CACHE_CREATION_TOKENS=" + ((.usage.cache_creation_input_tokens // "") | tostring),
+                   "CLAUDE_NUM_TURNS=" + ((.num_turns // "") | tostring),
+                   "CLAUDE_DURATION_MS=" + ((.duration_ms // "") | tostring)' \
+              "$output_file" >> "$GITHUB_ENV" 2>/dev/null || true
+
             exit "$claude_exit"
           fi
 
