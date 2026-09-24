@@ -42,6 +42,11 @@ env:
   # change silently (e.g. on a claude-code upgrade) and this pipeline doesn't leave
   # anything else to chance either. Set as a repo variable, same place as the others.
   CLAUDE_MODEL: ${{ vars.CLAUDE_MODEL }}
+  # Both blank here in practice — no workflow_dispatch trigger on this file, only
+  # repository_dispatch — but read the same way every other agent does. See
+  # docs/dashboard-plan.md.
+  CAUSED_BY_RUN_ID: ${{ github.event.client_payload.caused_by_run_id }}
+  TRIGGERED_BY: ${{ github.event.client_payload.triggered_by }}
 
 jobs:
   intake:
@@ -65,6 +70,10 @@ jobs:
         env:
           CLICKUP_API_TOKEN: ${{ secrets.CLICKUP_API_TOKEN }}
         run: |
+          # Captured unconditionally, before `set -euo pipefail` even engages — see
+          # agent-review.yml's identical line for why.
+          echo "STARTED_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_ENV"
+
           set -euo pipefail
 
           http_code=$(curl -sS -o task.json -w '%{http_code}' \
@@ -235,6 +244,7 @@ jobs:
           model="${CLAUDE_MODEL:-claude-sonnet-5}"
           echo "Using model: ${model}"
 
+          claude_output="${RUNNER_TEMP}/claude-output.txt"
           (
             cd "$workdir"
             claude -p "$prompt" \
@@ -242,7 +252,32 @@ jobs:
               --allowed-tools "Read,Write" \
               --max-turns 8 \
               --output-format stream-json --verbose
-          )
+          ) | tee "$claude_output"
+
+          # Already --output-format stream-json (JSONL, one JSON object per line) —
+          # unlike the other three agents, no format change was needed here to get
+          # cost/session data: the final line of stream-json output is the same
+          # terminal "result" object --output-format json returns as its one-shot
+          # result, verified locally against a real invocation. `|| true` on both:
+          # `tail -1 | jq` failing (e.g. a truncated/empty output) shouldn't abort a
+          # script that's about to make a real pass/fail decision based on
+          # rewritten.md instead, not on this extraction.
+          jq -c '{session_id, model: ((.modelUsage // {}) | keys | last), cost_usd: .total_cost_usd,
+                  input_tokens: .usage.input_tokens, output_tokens: .usage.output_tokens,
+                  cache_read_tokens: .usage.cache_read_input_tokens,
+                  cache_creation_tokens: .usage.cache_creation_input_tokens,
+                  num_turns, duration_ms}' <(tail -1 "$claude_output") > "${RUNNER_TEMP}/claude-usage.json" || true
+
+          jq -r '"CLAUDE_SESSION_ID=" + (.session_id // ""),
+                 "CLAUDE_MODEL_USED=" + (.model // ""),
+                 "CLAUDE_COST_USD=" + ((.cost_usd // "") | tostring),
+                 "CLAUDE_INPUT_TOKENS=" + ((.input_tokens // "") | tostring),
+                 "CLAUDE_OUTPUT_TOKENS=" + ((.output_tokens // "") | tostring),
+                 "CLAUDE_CACHE_READ_TOKENS=" + ((.cache_read_tokens // "") | tostring),
+                 "CLAUDE_CACHE_CREATION_TOKENS=" + ((.cache_creation_tokens // "") | tostring),
+                 "CLAUDE_NUM_TURNS=" + ((.num_turns // "") | tostring),
+                 "CLAUDE_DURATION_MS=" + ((.duration_ms // "") | tostring)' \
+            "${RUNNER_TEMP}/claude-usage.json" >> "$GITHUB_ENV" 2>/dev/null || true
 
           if [ ! -s "$workdir/rewritten.md" ]; then
             echo "::error::rewritten.md was not produced (or is empty) for ticket ${TICKET_ID}"
@@ -303,8 +338,59 @@ jobs:
         run: |
           if [ "${{ steps.guard.outputs.already_processed }}" = "true" ]; then
             echo "Ticket ${TICKET_ID}: already-processed."
+            echo "OUTCOME=already-processed" >> "$GITHUB_ENV"
           elif [ "${{ job.status }}" = "success" ]; then
             echo "Ticket ${TICKET_ID}: rewritten."
+            echo "OUTCOME=rewritten" >> "$GITHUB_ENV"
           else
             echo "Ticket ${TICKET_ID}: failed."
+            echo "OUTCOME=failed" >> "$GITHUB_ENV"
           fi
+
+      - name: Emit run record
+        if: always()
+        continue-on-error: true
+        run: |
+          set -uo pipefail
+
+          # Status only actually changes for a fresh run past the guard — an
+          # already-processed ticket is left exactly as found (this workflow never
+          # even reaches the lock step for it).
+          status_after="to do"
+          if [ "${{ steps.guard.outputs.already_processed }}" = "false" ]; then
+            status_after="${IN_SPEC_STATUS:-in spec}"
+          fi
+
+          RUN_ID="${{ github.run_id }}-${{ github.run_attempt }}" \
+          RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+          WORKFLOW="agent-intake" \
+          EVENT_TYPE="${{ github.event.action || 'workflow_dispatch' }}" \
+          TICKET_ID="${TICKET_ID}" \
+          CAUSED_BY_RUN_ID="${CAUSED_BY_RUN_ID:-}" \
+          TRIGGERED_BY="${TRIGGERED_BY:-manual}" \
+          STARTED_AT="${STARTED_AT:-}" \
+          FINISHED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+          OUTCOME="${OUTCOME:-failed}" \
+          CLICKUP_STATUS_BEFORE="to do" \
+          CLICKUP_STATUS_AFTER="$status_after" \
+          CLAUDE_SESSION_ID="${CLAUDE_SESSION_ID:-}" \
+          CLAUDE_MODEL_USED="${CLAUDE_MODEL_USED:-}" \
+          CLAUDE_COST_USD="${CLAUDE_COST_USD:-}" \
+          CLAUDE_INPUT_TOKENS="${CLAUDE_INPUT_TOKENS:-}" \
+          CLAUDE_OUTPUT_TOKENS="${CLAUDE_OUTPUT_TOKENS:-}" \
+          CLAUDE_CACHE_READ_TOKENS="${CLAUDE_CACHE_READ_TOKENS:-}" \
+          CLAUDE_CACHE_CREATION_TOKENS="${CLAUDE_CACHE_CREATION_TOKENS:-}" \
+          CLAUDE_NUM_TURNS="${CLAUDE_NUM_TURNS:-}" \
+          CLAUDE_DURATION_MS="${CLAUDE_DURATION_MS:-}" \
+            node .github/scripts/record-run.mjs > "${RUNNER_TEMP}/run-record.json"
+
+          cat "${RUNNER_TEMP}/run-record.json"
+
+      - name: Upload run record
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: run-record-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/run-record.json
+          retention-days: 90

@@ -93,9 +93,18 @@ jobs:
       # human typically makes before asking for help, while bounding spend on a change
       # that's fundamentally stuck.
       MAX_E2E_RETRIES: 3
+      # This run's own "cause," for its own run-record (see docs/dashboard-plan.md) —
+      # not a client_payload field like every other agent's, since this workflow is
+      # triggered by workflow_run completing, not a dispatch. TRIGGERED_BY is a value
+      # none of the other agents use ("poller"/"reactor"/"manual"), since this
+      # workflow's own trigger mechanism genuinely is a fourth, distinct thing.
+      CAUSED_BY_RUN_ID: ${{ github.event.workflow_run.id }}-${{ github.event.workflow_run.run_attempt }}
+      TRIGGERED_BY: poc-e2e
     steps:
       - name: Strip the poc/ prefix
-        run: echo "TICKET_ID=${TICKET_ID#poc/}" >> "$GITHUB_ENV"
+        run: |
+          echo "STARTED_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_ENV"
+          echo "TICKET_ID=${TICKET_ID#poc/}" >> "$GITHUB_ENV"
 
       - name: Guards — in progress, not stale
         id: guard
@@ -142,6 +151,25 @@ jobs:
 
           echo "proceed=true" >> "$GITHUB_OUTPUT"
 
+      - name: Checkout (for record-run.mjs — the green path has no other checkout)
+        # The green path never checks out the repo at all otherwise; the failure path's
+        # own full checkout further down still runs too, harmlessly redundant with this
+        # one. Sparse: this step only needs one script file, not the whole tree.
+        if: steps.guard.outputs.proceed == 'true'
+        uses: actions/checkout@v5
+        with:
+          sparse-checkout: .github/scripts
+          sparse-checkout-cone-mode: false
+
+      - name: Capture record-run.mjs
+        # Must happen now, on develop — not read later from a repo-relative path. The
+        # failure path's later checkout switches the working tree to poc/<ticket_id>,
+        # which can predate this script's addition to develop entirely, same reasoning
+        # as agent-implement.yml/agent-review.yml's own "capture the prompt before the
+        # branch switch" steps.
+        if: steps.guard.outputs.proceed == 'true'
+        run: cp .github/scripts/record-run.mjs "${RUNNER_TEMP}/record-run.mjs"
+
       - name: On green — mark ready for review
         if: steps.guard.outputs.proceed == 'true' && github.event.workflow_run.conclusion == 'success'
         env:
@@ -180,6 +208,10 @@ jobs:
             -d "$comment_payload" || true
 
           echo "Ticket ${TICKET_ID}: e2e green — moved to \"ready for review\", PR undrafted."
+          {
+            echo "OUTCOME=success"
+            echo "CLICKUP_STATUS_AFTER=ready for review"
+          } >> "$GITHUB_ENV"
 
       - name: Check out the ticket branch (failure path only)
         if: steps.guard.outputs.proceed == 'true' && github.event.workflow_run.conclusion == 'failure'
@@ -227,6 +259,11 @@ jobs:
               -d "$comment_payload" || true
 
             echo "Ticket ${TICKET_ID}: e2e retries exhausted (${count}/${MAX_E2E_RETRIES}) — tagged needs-human, status left at \"in progress\", not retrying."
+            {
+              echo "OUTCOME=failed"
+              echo "FAILURE_CLASS=retries-exhausted"
+              echo "CLICKUP_STATUS_AFTER=in progress"
+            } >> "$GITHUB_ENV"
             exit 0
           fi
 
@@ -272,6 +309,7 @@ jobs:
 
           failure_count=$(echo "$failures" | jq 'length')
 
+          failure_class=""
           if [ "$failure_count" -eq 0 ]; then
             ci_failure=$(printf 'poc-e2e.yml failed (run %s) but no specific failing test could be extracted from its results — check the run log directly.' "$RUN_URL")
           else
@@ -279,9 +317,11 @@ jobs:
 
             if [ "$new_spec_failing" = "true" ] && [ -n "$new_spec_basename" ]; then
               kind="Your own new spec is failing — the implementation doesn't satisfy it yet."
+              failure_class="did-not-do-task"
               relevant=$(echo "$failures" | jq --arg name "$new_spec_basename" '[.[] | select(.file == $name)]')
             else
               kind="Your new spec passes, but this change broke a different, previously-passing test — a regression."
+              failure_class="collateral-breakage"
               relevant="$failures"
             fi
 
@@ -297,11 +337,16 @@ jobs:
           # unbounded text either.
           ci_failure=$(printf '%s' "$ci_failure" | head -c 3000)
 
+          # caused_by_run_id + triggered_by: feed the eventual agent-implement.yml
+          # retry's own run-record emit step (see docs/dashboard-plan.md) — this
+          # workflow's own run is the "cause" of the dispatch, and it's always a
+          # "reactor" trigger by definition, never a poller or a manual re-run.
           payload=$(jq -n \
             --arg ticket_id "$TICKET_ID" \
             --arg ci_failure "$ci_failure" \
             --argjson attempt_number "$((count + 1))" \
-            '{event_type: "clickup-implement", client_payload: {ticket_id: $ticket_id, ci_failure: $ci_failure, attempt_number: $attempt_number}}')
+            --arg caused_by_run_id "${{ github.run_id }}-${{ github.run_attempt }}" \
+            '{event_type: "clickup-implement", client_payload: {ticket_id: $ticket_id, ci_failure: $ci_failure, attempt_number: $attempt_number, caused_by_run_id: $caused_by_run_id, triggered_by: "reactor"}}')
 
           http_code=$(curl -sS -o "${RUNNER_TEMP}/dispatch-response.json" -w '%{http_code}' \
             -X POST \
@@ -318,6 +363,11 @@ jobs:
           fi
 
           echo "Ticket ${TICKET_ID}: e2e red (attempt $((count + 1))/${MAX_E2E_RETRIES}) — dispatched a fix retry with real failure context."
+          {
+            echo "OUTCOME=e2e-red-retrying"
+            echo "FAILURE_CLASS=${failure_class}"
+            echo "CLICKUP_STATUS_AFTER=in progress"
+          } >> "$GITHUB_ENV"
 
       - name: On failure after the guards passed, flag for a human
         # Gated on the guards having passed, not on any single step's own outcome — this
@@ -347,3 +397,49 @@ jobs:
             -H "Content-Type: application/json" \
             "https://api.clickup.com/api/v2/task/${TICKET_ID}/comment" \
             -d "$comment_payload" || true
+
+      - name: Emit run record
+        # Gated on proceed == 'true', unlike every other agent's always() — the guards'
+        # whole job is to recognize e2e results this reactor has no business acting on
+        # (a propose-stage push, a stale superseded run) and skip them quietly; those
+        # aren't real agent actions and would just be noise in the run-record audit
+        # trail. See docs/dashboard-plan.md.
+        if: always() && steps.guard.outputs.proceed == 'true'
+        continue-on-error: true
+        run: |
+          set -uo pipefail
+
+          outcome="${OUTCOME:-}"
+          if [ -z "$outcome" ]; then
+            case "${{ job.status }}" in
+              success) outcome="success" ;;
+              cancelled) outcome="cancelled" ;;
+              *) outcome="failed" ;;
+            esac
+          fi
+
+          RUN_ID="${{ github.run_id }}-${{ github.run_attempt }}" \
+          RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+          WORKFLOW="agent-react-to-e2e" \
+          EVENT_TYPE="workflow_run" \
+          TICKET_ID="${TICKET_ID}" \
+          CAUSED_BY_RUN_ID="${CAUSED_BY_RUN_ID:-}" \
+          TRIGGERED_BY="${TRIGGERED_BY:-poc-e2e}" \
+          STARTED_AT="${STARTED_AT:-}" \
+          FINISHED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+          OUTCOME="$outcome" \
+          FAILURE_CLASS="${FAILURE_CLASS:-}" \
+          CLICKUP_STATUS_BEFORE="in progress" \
+          CLICKUP_STATUS_AFTER="${CLICKUP_STATUS_AFTER:-in progress}" \
+            node "${RUNNER_TEMP}/record-run.mjs" > "${RUNNER_TEMP}/run-record.json"
+
+          cat "${RUNNER_TEMP}/run-record.json"
+
+      - name: Upload run record
+        if: always() && steps.guard.outputs.proceed == 'true'
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: run-record-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/run-record.json
+          retention-days: 90
