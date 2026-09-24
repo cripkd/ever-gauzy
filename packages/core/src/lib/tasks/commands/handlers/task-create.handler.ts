@@ -53,14 +53,6 @@ export class TaskCreateHandler implements ICommandHandler<TaskCreateCommand> {
 			const { input, triggeredEvent } = command;
 			const { organizationId, mentionEmployeeIds = [], members = [], ...data } = input;
 
-			// An Employee-role creator who picked no members should still end up assigned to
-			// their own task. RequestContext.currentEmployeeId() already encodes that role
-			// check: it returns null for anyone holding CHANGE_SELECTED_EMPLOYEE (admins and
-			// managers), so this only fires for the plain-Employee creator case.
-			const creatorEmployeeId = RequestContext.currentEmployeeId();
-			const resolvedMembers: IEmployee[] =
-				members.length === 0 && creatorEmployeeId ? [{ id: creatorEmployeeId } as IEmployee] : members;
-
 			// Retrieve current tenant ID from request context or use input tenant ID
 			const tenantId = RequestContext.currentTenantId() ?? data.tenantId;
 
@@ -90,7 +82,7 @@ export class TaskCreateHandler implements ICommandHandler<TaskCreateCommand> {
 			// Create the task with incremented number, project prefix, and other task details
 			const task = await this._taskService.create({
 				...data, // Spread the input properties
-				members: resolvedMembers.map(({ id }) => new Employee({ id })),
+				members: members.map(({ id }) => new Employee({ id })),
 				number: maxNumber + 1, // Increment the task number
 				prefix: projectPrefix, // Use the project prefix, or null if no project
 				tenantId, // Pass the tenant ID
@@ -133,10 +125,10 @@ export class TaskCreateHandler implements ICommandHandler<TaskCreateCommand> {
 			);
 
 			// Subscribe assignees to the task
-			if (resolvedMembers.length > 0) {
+			if (members.length > 0) {
 				try {
 					// Map employee IDs to IDs
-					const employeeIds = resolvedMembers.map(({ id }) => id);
+					const employeeIds = members.map(({ id }) => id);
 
 					// Find active employees by employee IDs
 					const employees = await this._employeeService.findActiveEmployeesByEmployeeIds(
