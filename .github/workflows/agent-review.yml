@@ -206,8 +206,16 @@ jobs:
             > "$claude_config"
 
       - name: Install the Claude Code CLI and the superpowers plugin
+        # Real failure on the first live run: `claude plugin install superpowers@...`
+        # failed with "Plugin superpowers not found in marketplace claude-plugins-official"
+        # — a fresh `npm install -g @anthropic-ai/claude-code` on a clean runner doesn't
+        # ship an up-to-date marketplace catalog. Verified locally against this session's
+        # own (already-synced) machine, which is exactly why this gap wasn't caught then —
+        # `claude plugin marketplace update` first is the fix the error message itself
+        # names, refreshing the catalog before the install that depends on it.
         run: |
           npm install -g @anthropic-ai/claude-code
+          claude plugin marketplace update claude-plugins-official
           claude plugin install superpowers@claude-plugins-official
 
       - name: Run the review agent
