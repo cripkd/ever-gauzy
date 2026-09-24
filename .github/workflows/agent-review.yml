@@ -30,12 +30,17 @@ name: Agent Review
 #      reads the change's own files directly.
 #   4. Write the ticket's description to ticket.md (git-ignored locally), same
 #      supplementary-context pattern as implement/propose.
-#   5. Install Claude Code, then the superpowers plugin (`claude plugin install
-#      superpowers@claude-plugins-official` — already in the default marketplace,
-#      verified directly earlier; no `marketplace add` needed). No node_modules restore
-#      at all: this workflow never builds, lints, or runs anything, only reads source and
-#      diffs via git, so the dependency bring-up agent-implement.yml needs simply doesn't
-#      apply here — meaningfully lighter and faster than an implement run.
+#   5. Install Claude Code, then the superpowers plugin — `claude plugin marketplace add
+#      https://github.com/obra/superpowers-marketplace` (the full URL, not the bare
+#      owner/repo shorthand — that clones via SSH, which a runner has no key for) then
+#      `claude plugin install superpowers@superpowers-marketplace`. Two real dispatch
+#      failures got this here: a fresh CLI install configures no marketplaces at all
+#      (there's no built-in default), and the bare-shorthand add form fails over SSH in
+#      CI even though it works fine on a machine that already has SSH access configured.
+#      No node_modules restore at all: this workflow never builds, lints, or runs
+#      anything, only reads source and diffs via git, so the dependency bring-up
+#      agent-implement.yml needs simply doesn't apply here — meaningfully lighter and
+#      faster than an implement run.
 #   6. claude -p, model pinned via CLAUDE_MODEL, --allowed-tools
 #      "Read,Grep,Glob,Skill,Task,Bash(git diff:*),Bash(git log:*),Bash(git show:*)".
 #      Read-only: Claude never commits, pushes, or touches the PR/ClickUp directly — the
@@ -206,17 +211,23 @@ jobs:
             > "$claude_config"
 
       - name: Install the Claude Code CLI and the superpowers plugin
-        # Real failure on the first live run: `claude plugin install superpowers@...`
-        # failed with "Plugin superpowers not found in marketplace claude-plugins-official"
-        # — a fresh `npm install -g @anthropic-ai/claude-code` on a clean runner doesn't
-        # ship an up-to-date marketplace catalog. Verified locally against this session's
-        # own (already-synced) machine, which is exactly why this gap wasn't caught then —
-        # `claude plugin marketplace update` first is the fix the error message itself
-        # names, refreshing the catalog before the install that depends on it.
+        # Two real failures here, in order, both from assuming instead of verifying
+        # against a genuinely clean runner (this session's own machine already had
+        # state from earlier manual use, which is exactly why neither gap showed up
+        # until a real dispatch hit them):
+        #   1. `claude-plugins-official` isn't a built-in default marketplace — a fresh
+        #      `npm install -g @anthropic-ai/claude-code` configures ZERO marketplaces
+        #      (confirmed on a real run: "Available marketplaces: " came back empty).
+        #      "marketplace update" on something never added can't work either.
+        #   2. `claude plugin marketplace add owner/repo` (the bare shorthand) clones via
+        #      SSH (`git@github.com:...`) — verified locally — which a GitHub Actions
+        #      runner has no key configured for. The full https:// URL form forces HTTPS
+        #      cloning instead; verified locally that this exact sequence (add via full
+        #      URL, then install) succeeds end-to-end.
         run: |
           npm install -g @anthropic-ai/claude-code
-          claude plugin marketplace update claude-plugins-official
-          claude plugin install superpowers@claude-plugins-official
+          claude plugin marketplace add https://github.com/obra/superpowers-marketplace
+          claude plugin install superpowers@superpowers-marketplace
 
       - name: Run the review agent
         id: agent
