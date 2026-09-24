@@ -78,6 +78,10 @@ permissions:
 env:
   TICKET_ID: ${{ github.event.client_payload.ticket_id || inputs.ticket_id }}
   CLAUDE_MODEL: ${{ vars.CLAUDE_MODEL }}
+  # Both blank on a workflow_dispatch run (a manual re-run) — the run-record emit step
+  # falls back to "manual" for TRIGGERED_BY in that case. See docs/dashboard-plan.md.
+  CAUSED_BY_RUN_ID: ${{ github.event.client_payload.caused_by_run_id }}
+  TRIGGERED_BY: ${{ github.event.client_payload.triggered_by }}
 
 jobs:
   review:
@@ -90,6 +94,11 @@ jobs:
         env:
           CLICKUP_API_TOKEN: ${{ secrets.CLICKUP_API_TOKEN }}
         run: |
+          # Captured unconditionally, before `set -euo pipefail` even engages, so a
+          # failure anywhere in this step (including the lock itself) still leaves a
+          # start time for the run-record emit step at the end of the job to use.
+          echo "STARTED_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_ENV"
+
           set -euo pipefail
 
           payload=$(jq -n '{status: "in review"}')
@@ -166,6 +175,7 @@ jobs:
           echo "Resolved OpenSpec change: ${change_name}"
           echo "$change_name" > .change-name
           echo ".change-name" >> .git/info/exclude
+          echo "SPEC_ID=${change_name}" >> "$GITHUB_ENV"
 
       - name: Write the ticket to ticket.md
         env:
@@ -244,12 +254,12 @@ jobs:
           claude_exit=0
           claude -p "$prompt" \
             --model "$model" \
+            --output-format json \
             --allowed-tools "Read,Grep,Glob,Skill,Task,Bash(git diff:*),Bash(git log:*),Bash(git show:*)" \
             > "$output_file" 2>&1 || claude_exit=$?
 
-          cat "$output_file"
-
           if [ "$claude_exit" -ne 0 ]; then
+            cat "$output_file"
             echo "::error::claude exited with status ${claude_exit}"
             {
               echo "claude exited with status ${claude_exit}."
@@ -259,17 +269,46 @@ jobs:
             exit "$claude_exit"
           fi
 
+          # --output-format json means $output_file is now one JSON object, not the
+          # free-text stdout every RESULT:-grep downstream expects — extract .result
+          # (Claude's actual final text, identical in content to what plain text mode
+          # would have printed) before any of that existing parsing runs. See
+          # docs/dashboard-plan.md's Phase A2 for why: this also gets the cost/session
+          # data for the run-record emit step at no extra invocation cost.
+          result_text="${RUNNER_TEMP}/claude-result.txt"
+          jq -r '.result' "$output_file" > "$result_text"
+
+          echo "--- Claude's final result ---"
+          cat "$result_text"
+
+          jq -c '{session_id, model: ((.modelUsage // {}) | keys | last), cost_usd: .total_cost_usd,
+                  input_tokens: .usage.input_tokens, output_tokens: .usage.output_tokens,
+                  cache_read_tokens: .usage.cache_read_input_tokens,
+                  cache_creation_tokens: .usage.cache_creation_input_tokens,
+                  num_turns, duration_ms}' "$output_file" > "${RUNNER_TEMP}/claude-usage.json"
+
+          jq -r '"CLAUDE_SESSION_ID=" + (.session_id // ""),
+                 "CLAUDE_MODEL_USED=" + (.model // ""),
+                 "CLAUDE_COST_USD=" + ((.cost_usd // "") | tostring),
+                 "CLAUDE_INPUT_TOKENS=" + ((.input_tokens // "") | tostring),
+                 "CLAUDE_OUTPUT_TOKENS=" + ((.output_tokens // "") | tostring),
+                 "CLAUDE_CACHE_READ_TOKENS=" + ((.cache_read_tokens // "") | tostring),
+                 "CLAUDE_CACHE_CREATION_TOKENS=" + ((.cache_creation_tokens // "") | tostring),
+                 "CLAUDE_NUM_TURNS=" + ((.num_turns // "") | tostring),
+                 "CLAUDE_DURATION_MS=" + ((.duration_ms // "") | tostring)' \
+            "${RUNNER_TEMP}/claude-usage.json" >> "$GITHUB_ENV"
+
           # `|| true`: grep exits 1 if RESULT: is missing, which would otherwise abort
           # this line under the externally active `bash -e` before the check below ever
           # runs — same class of bug already fixed elsewhere in this pipeline.
-          result=$(grep -m1 '^RESULT:' "$output_file" | sed 's/^RESULT: *//') || true
+          result=$(grep -m1 '^RESULT:' "$result_text" | sed 's/^RESULT: *//') || true
 
           if [ "$result" != "reviewed" ]; then
             echo "::error::claude's output has no RESULT: reviewed line"
             {
               echo "claude's output has no RESULT: reviewed line — cannot confirm the review completed."
               echo
-              tail -c 2000 "$output_file"
+              tail -c 2000 "$result_text"
             } > "${RUNNER_TEMP}/failure-reason.txt"
             exit 1
           fi
@@ -278,7 +317,7 @@ jobs:
           # grep -v exits 1 if every line matches (a degenerate all-RESULT: output),
           # which would otherwise abort the script here under the externally active
           # `bash -e` — same reasoning as the guard above.
-          grep -v '^RESULT:' "$output_file" > "${RUNNER_TEMP}/review-body.txt" || true
+          grep -v '^RESULT:' "$result_text" > "${RUNNER_TEMP}/review-body.txt" || true
 
       - name: Post the review to GitHub, then a short ClickUp pointer
         env:
@@ -344,6 +383,7 @@ jobs:
           fi
 
           echo "Ticket ${TICKET_ID}: review posted to ${pr_url}."
+          echo "OUTCOME=reviewed" >> "$GITHUB_ENV"
 
       - name: On failure after the lock, flag for a human
         if: failure() && steps.lock.outcome == 'success'
@@ -374,3 +414,60 @@ jobs:
             -H "Content-Type: application/json" \
             "https://api.clickup.com/api/v2/task/${TICKET_ID}/comment" \
             -d "$comment_payload" || true
+
+      - name: Emit run record
+        # if: always() — not gated on the lock even having succeeded, unlike every other
+        # step here: a failed lock still means something happened worth an audit entry
+        # (STARTED_AT is captured before the lock step's own `set -euo pipefail` even
+        # engages, so it's always available). See docs/dashboard-plan.md.
+        if: always()
+        continue-on-error: true
+        run: |
+          set -uo pipefail
+
+          # OUTCOME is set explicitly on the one clean-success path above ("reviewed");
+          # anything else falls back to the job's own status. `job.status` is exactly
+          # what GitHub Actions exposes for this — accurate even from an always() step.
+          outcome="${OUTCOME:-}"
+          if [ -z "$outcome" ]; then
+            case "${{ job.status }}" in
+              success) outcome="success" ;;
+              cancelled) outcome="cancelled" ;;
+              *) outcome="failed" ;;
+            esac
+          fi
+
+          RUN_ID="${{ github.run_id }}-${{ github.run_attempt }}" \
+          RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+          WORKFLOW="agent-review" \
+          EVENT_TYPE="${{ github.event.action || 'workflow_dispatch' }}" \
+          TICKET_ID="${TICKET_ID}" \
+          SPEC_ID="${SPEC_ID:-}" \
+          CAUSED_BY_RUN_ID="${CAUSED_BY_RUN_ID:-}" \
+          TRIGGERED_BY="${TRIGGERED_BY:-manual}" \
+          STARTED_AT="${STARTED_AT:-}" \
+          FINISHED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+          OUTCOME="$outcome" \
+          CLICKUP_STATUS_BEFORE="ready for review" \
+          CLICKUP_STATUS_AFTER="in review" \
+          CLAUDE_SESSION_ID="${CLAUDE_SESSION_ID:-}" \
+          CLAUDE_MODEL_USED="${CLAUDE_MODEL_USED:-}" \
+          CLAUDE_COST_USD="${CLAUDE_COST_USD:-}" \
+          CLAUDE_INPUT_TOKENS="${CLAUDE_INPUT_TOKENS:-}" \
+          CLAUDE_OUTPUT_TOKENS="${CLAUDE_OUTPUT_TOKENS:-}" \
+          CLAUDE_CACHE_READ_TOKENS="${CLAUDE_CACHE_READ_TOKENS:-}" \
+          CLAUDE_CACHE_CREATION_TOKENS="${CLAUDE_CACHE_CREATION_TOKENS:-}" \
+          CLAUDE_NUM_TURNS="${CLAUDE_NUM_TURNS:-}" \
+          CLAUDE_DURATION_MS="${CLAUDE_DURATION_MS:-}" \
+            node .github/scripts/record-run.mjs > "${RUNNER_TEMP}/run-record.json"
+
+          cat "${RUNNER_TEMP}/run-record.json"
+
+      - name: Upload run record
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: run-record-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/run-record.json
+          retention-days: 90

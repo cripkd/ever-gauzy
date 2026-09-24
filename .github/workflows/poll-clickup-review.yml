@@ -120,8 +120,13 @@ jobs:
           for ((i = 0; i < dispatch_count; i++)); do
             ticket_id="${ids[$i]}"
 
+            # caused_by_run_id + triggered_by: feed agent-review.yml's own run-record
+            # emit step (see docs/dashboard-plan.md) — this poller's own run is the
+            # "cause" of the dispatch it's about to make, and it's always a "poller"
+            # trigger by definition (never a reactor retry or a manual re-run).
             payload=$(jq -n --arg ticket_id "$ticket_id" \
-              '{event_type: "clickup-review", client_payload: {ticket_id: $ticket_id}}')
+              --arg caused_by_run_id "${{ github.run_id }}-${{ github.run_attempt }}" \
+              '{event_type: "clickup-review", client_payload: {ticket_id: $ticket_id, caused_by_run_id: $caused_by_run_id, triggered_by: "poller"}}')
 
             http_code=$(curl -sS -o dispatch-response.json -w '%{http_code}' \
               -X POST \
