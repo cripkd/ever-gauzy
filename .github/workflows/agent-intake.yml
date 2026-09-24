@@ -12,7 +12,10 @@ name: Agent Intake
 #   2. PUT  status -> IN SPEC, first thing after the guard passes. This is itself a
 #      second guard, cheaper than the first: poll-clickup-intake.yml only ever queries
 #      `statuses[]=to%20do`, so a ticket moved out of to do can't be re-dispatched by
-#      the next poll cycle while this run is still working it.
+#      the next poll cycle while this run is still working it. Immediately after:
+#      DELETE the "for-ai" tag — it gates every stage's own dispatch independently, so
+#      a human has to re-add it deliberately at "ready for spec" for propose to run
+#      automatically too, rather than it just carrying over as a stale leftover.
 #   3. POST the original description into Original report, verbatim (bash does the
 #      copy, not the model — this is what guarantees "verbatim").
 #   4. claude -p, no MCP/Bash/network, Read+Write scoped to an isolated scratch dir
@@ -125,6 +128,18 @@ jobs:
           fi
 
           echo "Ticket ${TICKET_ID}: moved to \"${status}\"."
+
+          # Consumes the tag now that this gate is passed. "for-ai" gates every stage's
+          # own dispatch independently — poll-clickup-propose.yml checks it fresh before
+          # the NEXT stage runs — so it has to be re-added deliberately each time a human
+          # wants automation to continue, not inherited as a leftover from here. Best
+          # effort, not gated on http_code the way the status PUT above is: the lock
+          # itself already succeeded by this point.
+          tag_remove_code=$(curl -sS -o /dev/null -w '%{http_code}' \
+            -X DELETE \
+            -H "Authorization: ${CLICKUP_API_TOKEN}" \
+            "https://api.clickup.com/api/v2/task/${TICKET_ID}/tag/for-ai" || true)
+          echo "Ticket ${TICKET_ID}: removed \"for-ai\" tag (HTTP ${tag_remove_code})."
 
       - name: Copy original description into Original report, verbatim
         if: steps.guard.outputs.already_processed == 'false'

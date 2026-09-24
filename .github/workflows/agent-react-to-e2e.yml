@@ -17,19 +17,21 @@ name: Agent React to E2E
 #   1. Job-level `if:` — branch must look like poc/<ticket_id>, or skip the whole job.
 #      Not every PR in this repo is a ticket branch (e.g. one opened directly against
 #      develop).
-#   2. Three guards, all in one step, each exiting quietly (not as a failure) rather than
+#   2. Two guards, both in one step, each exiting quietly (not as a failure) rather than
 #      acting on an e2e run this workflow has no business touching:
 #        - Status must be "in progress". Confirmed necessary, not defensive-coding
 #          paranoia: propose's own PR push (openspec markdown only, zero code) produced a
 #          GREEN poc-e2e run on this same ticket while it was still at "spec proposed" —
 #          without this guard, every propose-stage PR would get wrongly advanced straight
 #          to "ready for review", undrafted, skipping the entire implement stage.
-#        - "for-ai" must be tagged — same opt-in every poller in this pipeline already
-#          requires, checked fresh here too, so a human who pulled a ticket out of
-#          automation doesn't have their manual push advance the ticket out from under
-#          them.
 #        - head_sha must still be the branch tip — a stale result (superseded by a newer
 #          push already) gets skipped rather than acted on.
+#      Deliberately NOT a guard here: "for-ai". Every poller requires it fresh before ITS
+#      OWN dispatch, but agent-implement.yml's lock already consumes the tag the moment it
+#      starts — long before e2e ever runs — so checking for it here would always read
+#      false and this reactor would never act, on green or red. Reacting to an e2e result
+#      isn't a new gate needing its own authorization; it's the automatic continuation of
+#      whatever implement run already got authorized and pushed.
 #   3. success -> PUT status "ready for review", `gh pr ready` (moved here from
 #      agent-implement.yml, which now stops one step short of this — gated on a REAL
 #      green e2e result, not just a locally-clean self-check), short ClickUp comment.
@@ -95,7 +97,7 @@ jobs:
       - name: Strip the poc/ prefix
         run: echo "TICKET_ID=${TICKET_ID#poc/}" >> "$GITHUB_ENV"
 
-      - name: Guards — in progress, tagged for-ai, not stale
+      - name: Guards — in progress, not stale
         id: guard
         env:
           CLICKUP_API_TOKEN: ${{ secrets.CLICKUP_API_TOKEN }}
@@ -116,7 +118,6 @@ jobs:
           fi
 
           status=$(jq -r '.status' "$task_json")
-          has_for_ai=$(jq -r '([.tags[]?.name] | index("for-ai")) != null' "$task_json")
 
           if [ "$status" != "in progress" ]; then
             echo "Ticket ${TICKET_ID} is at \"${status}\", not \"in progress\" (e.g. a propose-stage PR push, not an implement one) — skipping quietly."
@@ -124,12 +125,14 @@ jobs:
             exit 0
           fi
 
-          if [ "$has_for_ai" != "true" ]; then
-            echo "Ticket ${TICKET_ID} is not tagged for-ai — a human owns this ticket right now, not automation. Skipping quietly."
-            echo "proceed=false" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-
+          # No for-ai check here, deliberately — unlike every poller, which requires it
+          # fresh before its own dispatch. agent-implement.yml's own lock already
+          # consumes for-ai the moment it starts (see its header comment), before this
+          # workflow ever runs, so checking for it here would always read false and
+          # this reactor would never act — on green OR red. Reacting to an e2e result is
+          # not a new gate needing its own fresh authorization; it's the automatic,
+          # already-authorized continuation of whatever implement run just pushed,
+          # whoever pushed it.
           current_sha=$(gh api "/repos/${{ github.repository }}/git/refs/heads/poc/${TICKET_ID}" --jq '.object.sha')
           if [ "$current_sha" != "$RUN_HEAD_SHA" ]; then
             echo "This run's commit (${RUN_HEAD_SHA}) is no longer poc/${TICKET_ID}'s tip (${current_sha}) — superseded by a newer push already. Skipping quietly."

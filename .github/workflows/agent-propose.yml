@@ -11,7 +11,10 @@ name: Agent Propose
 #      lock: poll-clickup-propose.yml only ever queries statuses[]=ready%20for%20spec,
 #      so a ticket moved out of that status can't be re-dispatched by a later poll
 #      cycle. If this fails, exit immediately — nothing else can safely proceed without
-#      knowing the lock was actually acquired.
+#      knowing the lock was actually acquired. Immediately after: DELETE the "for-ai"
+#      tag — it gates every stage's own dispatch independently, so a human has to
+#      re-add it deliberately once they approve this proposal and move it to
+#      "ready for dev", for implement to run automatically too.
 #   2. Full checkout (fetch-depth: 0), create the branch via the GitHub API (atomic —
 #      fails with a real error if it already exists, unlike a plain `git push` of an
 #      identical commit, which would silently no-op-succeed), check it out. If it
@@ -107,6 +110,19 @@ jobs:
           fi
 
           echo "Ticket ${TICKET_ID}: moved to \"spec proposed\"."
+
+          # Consumes the tag now that this gate is passed. "for-ai" gates every stage's
+          # own dispatch independently — poll-clickup-implement.yml checks it fresh
+          # before the NEXT stage runs — so it has to be re-added deliberately (once a
+          # human approves this proposal and moves it to "ready for dev") for implement
+          # to run automatically too, not inherited as a leftover from here. Best effort,
+          # not gated on http_code the way the status PUT above is: the lock itself
+          # already succeeded by this point.
+          tag_remove_code=$(curl -sS -o /dev/null -w '%{http_code}' \
+            -X DELETE \
+            -H "Authorization: ${CLICKUP_API_TOKEN}" \
+            "https://api.clickup.com/api/v2/task/${TICKET_ID}/tag/for-ai" || true)
+          echo "Ticket ${TICKET_ID}: removed \"for-ai\" tag (HTTP ${tag_remove_code})."
 
       - name: Checkout
         uses: actions/checkout@v5

@@ -104,10 +104,12 @@ jobs:
 
           echo "Ticket ${TICKET_ID}: moved to \"in review\"."
 
-          # Best-effort, not gated on http_code the way the status PUT above is: the lock
-          # itself already succeeded by this point, and no apply-fix poller exists yet to
-          # act on a stale "for-ai" tag anyway (see header comment) — this closes a gap
-          # for a later piece, it doesn't protect anything in THIS run.
+          # Consumes the tag now that this gate is passed — every agent's own lock does
+          # this (see header comment); "for-ai" gates each stage's dispatch
+          # independently, so it must be re-added deliberately for the next stage (or a
+          # future apply-fix step) to run automatically too. Best effort, not gated on
+          # http_code the way the status PUT above is: the lock itself already succeeded
+          # by this point.
           tag_remove_code=$(curl -sS -o /dev/null -w '%{http_code}' \
             -X DELETE \
             -H "Authorization: ${CLICKUP_API_TOKEN}" \

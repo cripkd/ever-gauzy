@@ -13,6 +13,9 @@ name: Agent Implement
 #      statuses[]=ready%20for%20dev, so a ticket moved out of that status can't be
 #      re-dispatched by a later poll cycle. On a retry dispatch the ticket is already at
 #      "in progress" — this PUT is then just a harmless, idempotent re-confirmation.
+#      Immediately after: DELETE the "for-ai" tag — it gates every stage's own dispatch
+#      independently, so a human has to re-add it deliberately at "ready for review" for
+#      review to run automatically too, not inherited as a leftover from here.
 #   2. Full checkout (fetch-depth: 0), then fetch + check out the EXISTING poc/<ticket_id>
 #      branch (unlike propose, this workflow never creates a branch — a ticket can't reach
 #      "ready for dev" without having gone through propose first, so the branch and its
@@ -126,6 +129,22 @@ jobs:
           fi
 
           echo "Ticket ${TICKET_ID}: moved to \"in progress\"."
+
+          # Consumes the tag now that this gate is passed. "for-ai" gates every stage's
+          # own dispatch independently — poll-clickup-review.yml checks it fresh before
+          # the NEXT stage runs — so it has to be re-added deliberately at "ready for
+          # review" for review to run automatically too, not inherited as a leftover
+          # from here. Harmless to also run this on a retry dispatch (CI_FAILURE set):
+          # retries bypass poll-clickup-implement.yml's own for-ai check entirely (they're
+          # fired directly by agent-react-to-e2e.yml, not via the poller), so there's
+          # nothing to protect by skipping it there, and DELETE on an already-removed tag
+          # is a harmless no-op. Best effort, not gated on http_code the way the status
+          # PUT above is: the lock itself already succeeded by this point.
+          tag_remove_code=$(curl -sS -o /dev/null -w '%{http_code}' \
+            -X DELETE \
+            -H "Authorization: ${CLICKUP_API_TOKEN}" \
+            "https://api.clickup.com/api/v2/task/${TICKET_ID}/tag/for-ai" || true)
+          echo "Ticket ${TICKET_ID}: removed \"for-ai\" tag (HTTP ${tag_remove_code})."
 
       - name: Checkout
         uses: actions/checkout@v5
