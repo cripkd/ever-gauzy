@@ -21,7 +21,19 @@ assumed.
 | 3+4 | Failing test + Implement (one agent — see note) | `poll-clickup-implement.yml` → `agent-implement.yml`         | `ready for dev` → `in progress`              | Branch pushed: failing spec + implementation together      | Self-check (lint/typecheck/build, scoped to directly-touched projects) passes | CI             |
 | 5   | Verify            | `poc-e2e.yml` (CI) → `agent-react-to-e2e.yml` (reacts)       | `in progress` → `ready for review` (on green) | PR undrafted; screenshots/trace/HTML report on failure     | Whole accumulated Playwright suite green, for the exact pushed commit         | CI             |
 | 6   | Review            | `poll-clickup-review.yml` → `agent-review.yml`               | `ready for review` → `in review`             | GitHub PR review (AI-authored comments)                    | Review posted; you decide                                                   | **Human**      |
+| 6b  | Apply review feedback (optional) | `poll-clickup-apply-review.yml` → `agent-implement.yml` (`MODE=apply-review`) | `in review` → `in progress` → (via stage 5's reactor) `ready for review` | Same branch, review-comment-driven push (or a no-op if nothing was actionable) | Same as stage 3+4's self-check, then stage 5's e2e gate again | CI + **Human** |
 | 7   | Merge             | **Not built yet**                                           | `in review` → `ready for deploy` → `complete`| —                                                            | —                                                                             | —              |
+
+**Note on stage 6b:** Two ways to address review feedback, same human/AI choice pattern as
+every other stage — no new status either way. A human can just push a fixed commit to
+`poc/<ticket_id>` directly (the stage 5 reactor already reacts to any push on a ticket
+branch regardless of who made it). Or they re-add `for-ai` while the ticket sits at
+`in review`, and `agent-implement.yml` runs again in `apply-review` mode: same workflow,
+a different prompt (`prompts/apply-review.md`), fetching the PR's actual review comments
+fresh from GitHub rather than through the dispatch payload — agnostic to whether the
+comments came from `agent-review.yml` or a human reviewing directly on GitHub. `in
+progress` is reused as the transient state either way, which is why stage 5's reactor
+needed no changes to also close this loop.
 
 **Note on stage 3+4:** `propose.md` still writes `tasks.md` with task 1 as
 the failing Playwright spec, ordered first, same as always — but
@@ -145,13 +157,15 @@ Done. Stages, gates, run-log schema, deferred decisions with triggers.
 
 ### Step 2 — walking skeleton
 
-Superseded by building full automation directly (stages 1–6) rather than
+Superseded by building full automation directly (stages 1–6b) rather than
 one manual, by-hand walkthrough. Ticket `869f5qg9d` (a real,
 replayed-closed bug — task creation not assigning the creating employee)
-is the live end-to-end exercise instead: intake and spec done, implement
-done, e2e verification in progress (including one real retry cycle after
-a self-check OOM was found and fixed), review not yet reached, stage 7
-not built.
+is the live end-to-end exercise instead: intake, spec, implement, and e2e
+verification done (including one real retry cycle after a self-check OOM
+was found and fixed); a real AI review has now posted (raised a missing
+unit-test-coverage concern and flagged the run's own unchecked
+verification tasks); stage 6b (apply review feedback) is built but not
+yet exercised on this ticket; stage 7 not built.
 
 ---
 

@@ -1,0 +1,145 @@
+name: Poll ClickUp Apply Review
+
+# Finds ClickUp tasks whose review feedback a human wants AI to apply (status:
+# in review, tag: for-ai re-added after agent-review.yml's own lock consumed the
+# original one) and dispatches one clickup-apply-review run per task, for
+# agent-implement.yml to pick up in its apply-review mode.
+#
+# Same shape as poll-clickup-review.yml: no separate marker field — the dispatch lock
+# lives entirely in agent-implement.yml itself (same lock it already uses for a normal
+# implement dispatch: PUT status -> in progress, remove for-ai), which takes the task
+# out of this poller's own statuses[]=in%20review filter.
+#
+# One extra filter beyond the status, client-side after the fetch: requires the
+# "for-ai" tag, same as every other poller — a human re-adds it deliberately to signal
+# "let AI apply these fixes"; without it, the ticket sits at "in review" for a human to
+# address themselves (just pushing a commit directly, which the existing e2e reactor
+# already reacts to regardless of who pushed it — see agent-react-to-e2e.yml's own guard
+# comment). No exclusion tag: a blocked apply-review run reverts status to "in review"
+# without tagging anything that would need excluding here — its own lock already
+# consumed for-ai on the way in, which is what keeps a casual re-poll from re-dispatching
+# into the same blocker (see agent-implement.yml's "Handle blocked result" step).
+#
+# This workflow never writes to ClickUp — only reads, then dispatches via the GitHub API.
+
+on:
+  schedule:
+    - cron: '*/10 * * * *'
+  workflow_dispatch:
+
+concurrency:
+  group: poll-clickup-apply-review
+  cancel-in-progress: false
+
+permissions: {}
+
+env:
+  CLICKUP_LIST_ID: ${{ vars.CLICKUP_LIST_ID }}
+  IN_REVIEW_STATUS: 'in review'
+  MAX_DISPATCHES: 5
+
+jobs:
+  poll:
+    name: Poll and dispatch
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Verify the target status actually exists
+        env:
+          CLICKUP_API_TOKEN: ${{ secrets.CLICKUP_API_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          http_code=$(curl -sS -o list.json -w '%{http_code}' \
+            -H "Authorization: ${CLICKUP_API_TOKEN}" \
+            "https://api.clickup.com/api/v2/list/${CLICKUP_LIST_ID}")
+
+          if [ "$http_code" -lt 200 ] || [ "$http_code" -ge 300 ]; then
+            echo "::error::ClickUp GET list returned HTTP ${http_code}"
+            cat list.json
+            exit 1
+          fi
+
+          # A typo'd status name here would otherwise just return zero tasks, every
+          # run, forever — and look perfectly healthy the whole time.
+          found=$(jq -r --arg s "$IN_REVIEW_STATUS" '[.statuses[].status] | any(. == $s)' list.json)
+
+          if [ "$found" != "true" ]; then
+            echo "::error::\"${IN_REVIEW_STATUS}\" is not among this list's statuses:"
+            jq -r '.statuses[].status' list.json
+            exit 1
+          fi
+
+      - name: Fetch tasks in review
+        id: fetch
+        env:
+          CLICKUP_API_TOKEN: ${{ secrets.CLICKUP_API_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          http_code=$(curl -sS -o clickup-tasks.json -w '%{http_code}' \
+            -H "Authorization: ${CLICKUP_API_TOKEN}" \
+            "https://api.clickup.com/api/v2/list/${CLICKUP_LIST_ID}/task?statuses[]=in%20review&include_closed=false")
+
+          if [ "$http_code" -lt 200 ] || [ "$http_code" -ge 300 ]; then
+            echo "::error::ClickUp API returned HTTP ${http_code}"
+            cat clickup-tasks.json
+            exit 1
+          fi
+
+          # Requires "for-ai" — see header comment.
+          jq '.tasks |= map(select((.tags // []) | map(.name) | any(. == "for-ai")))' \
+            clickup-tasks.json > clickup-tasks-filtered.json
+          mv clickup-tasks-filtered.json clickup-tasks.json
+
+          matched=$(jq '.tasks | length' clickup-tasks.json)
+          echo "Tasks in review (tagged for-ai): ${matched}"
+          echo "matched=${matched}" >> "$GITHUB_OUTPUT"
+
+      - name: Exit quietly if nothing to do
+        if: steps.fetch.outputs.matched == '0'
+        run: echo "No tasks in review tagged for-ai — nothing to dispatch."
+
+      - name: Dispatch agent runs
+        if: steps.fetch.outputs.matched != '0'
+        env:
+          DISPATCH_PAT: ${{ secrets.DISPATCH_PAT }}
+        run: |
+          set -euo pipefail
+
+          mapfile -t ids < <(jq -r '.tasks[].id' clickup-tasks.json)
+          total=${#ids[@]}
+
+          dispatch_count=$total
+          if [ "$dispatch_count" -gt "$MAX_DISPATCHES" ]; then
+            dispatch_count=$MAX_DISPATCHES
+          fi
+
+          echo "Dispatching ${dispatch_count} of ${total} matched task(s) (cap: ${MAX_DISPATCHES})."
+
+          dispatched=0
+          for ((i = 0; i < dispatch_count; i++)); do
+            ticket_id="${ids[$i]}"
+
+            payload=$(jq -n --arg ticket_id "$ticket_id" \
+              '{event_type: "clickup-apply-review", client_payload: {ticket_id: $ticket_id}}')
+
+            http_code=$(curl -sS -o dispatch-response.json -w '%{http_code}' \
+              -X POST \
+              -H "Authorization: Bearer ${DISPATCH_PAT}" \
+              -H "Accept: application/vnd.github+json" \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
+              "https://api.github.com/repos/${{ github.repository }}/dispatches" \
+              -d "$payload")
+
+            if [ "$http_code" -lt 200 ] || [ "$http_code" -ge 300 ]; then
+              echo "::error::GitHub dispatch API returned HTTP ${http_code} for ticket ${ticket_id}"
+              cat dispatch-response.json
+              exit 1
+            fi
+
+            dispatched=$((dispatched + 1))
+            echo "Dispatched clickup-apply-review for ticket ${ticket_id} (${dispatched}/${dispatch_count})"
+          done
+
+          echo "Done: dispatched ${dispatched} of ${total} matched task(s)."

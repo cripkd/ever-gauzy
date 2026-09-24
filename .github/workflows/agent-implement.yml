@@ -1,11 +1,15 @@
 name: Agent Implement
 
-# Fires once per clickup-implement dispatch from either poll-clickup-implement.yml (a
-# fresh ticket, "ready for dev") or agent-react-to-e2e.yml (a retry, after a red e2e
-# result on a prior push from this same workflow). Executes an already-approved OpenSpec
-# change's tasks.md against the real codebase, on the same poc/<ticket_id> branch and
-# draft PR agent-propose.yml created, and pushes the result. See prompts/implement.md for
-# Claude's exact contract.
+# Fires once per dispatch from any of three sources, distinguished by MODE (below):
+#   - poll-clickup-implement.yml: a fresh ticket, "ready for dev" (MODE=implement)
+#   - agent-react-to-e2e.yml: a retry, after a red e2e result on a prior push from this
+#     same workflow (MODE=implement, CI_FAILURE set)
+#   - poll-clickup-apply-review.yml: a human re-added "for-ai" at "in review" to have AI
+#     apply review feedback (MODE=apply-review)
+# All three execute against the real codebase, on the same poc/<ticket_id> branch and
+# draft PR agent-propose.yml created, and push the result. See prompts/implement.md
+# (MODE=implement) or prompts/apply-review.md (MODE=apply-review) for Claude's exact
+# contract in each case.
 #
 # Flow:
 #   1. PUT status -> in progress. FIRST action, before checkout. Dispatch lock, same
@@ -22,7 +26,12 @@ name: Agent Implement
 #      draft PR must already exist; if the fetch fails, that's a real error). If this
 #      dispatch carries ci_failure (a retry), write it to .ci-failure.md here — the actual
 #      failure from the last real poc-e2e.yml run against this ticket's prior attempt, for
-#      the prompt to read and fix against, instead of guessing blind.
+#      the prompt to read and fix against, instead of guessing blind. If MODE is
+#      apply-review, fetch the PR's actual review comments instead (gh pr view --json
+#      reviews) and write them to .review-comments.md — fetched fresh from GitHub, not
+#      passed through the dispatch payload, so this works the same whether the comments
+#      came from agent-review.yml or a human reviewing directly on GitHub. Fails outright
+#      if there's nothing there to fetch, rather than run Claude with nothing to act on.
 #   3. Install Claude Code and the openspec CLI, then restore node_modules — this workflow
 #      DOES touch application code, unlike propose, so (unlike propose) it needs the full
 #      dependency tree. Reuses poc-e2e.yml's own restore/archive scripts and exact cache
@@ -43,32 +52,43 @@ name: Agent Implement
 #      execute it, not draft a new one.
 #   7. RESULT: blocked -> same shape as agent-propose.yml's insufficient-detail path: push
 #      whatever real progress exists (for inspection), revert status back to "ready for
-#      dev", tag "needs-human" AND "implement-blocked", comment with the reason. This is a
-#      clean, successful completion of the job (no exit 1) — a blocked run is the agent
-#      correctly refusing to guess, not a crash. The "implement-blocked" tag is what keeps
-#      the revert-to-"ready for dev" safe: poll-clickup-implement.yml skips any task
-#      carrying it, so this ticket won't be immediately re-dispatched into the same
-#      blocker on the next poll cycle — it only becomes pollable again once a human
-#      removes the tag (both tags must already exist in the ClickUp Space; unlike
-#      "needs-human", "implement-blocked" is new and must be created there once, manually,
-#      before this workflow's first blocked run).
+#      dev" (MODE=implement) or "in review" (MODE=apply-review — this ticket already went
+#      through review, so a blocked fix attempt belongs back at the human's own decision
+#      point, not all the way back to pre-implementation), tag "needs-human" and, only for
+#      MODE=implement, "implement-blocked" too (see that step's own comment for why
+#      apply-review doesn't need an equivalent), comment with the reason. This is a clean,
+#      successful completion of the job (no exit 1) — a blocked run is the agent correctly
+#      refusing to guess, not a crash. The "implement-blocked" tag is what keeps the
+#      revert-to-"ready for dev" safe: poll-clickup-implement.yml skips any task carrying
+#      it, so this ticket won't be immediately re-dispatched into the same blocker on the
+#      next poll cycle — it only becomes pollable again once a human removes the tag (both
+#      tags must already exist in the ClickUp Space; unlike "needs-human",
+#      "implement-blocked" is new and must be created there once, manually, before this
+#      workflow's first blocked run).
 #      RESULT: implemented -> self-check (nx affected lint/typecheck/build) before pushing;
 #      a self-check failure IS treated as a real failure (tag "needs-human", generic
 #      catch-all below) — unlike "blocked", the agent believed it was done and wasn't.
 #      A clean self-check leads to commit + push — NOT `gh pr ready`. The PR stays in
 #      draft: agent-react-to-e2e.yml is what undrafts it, gated on poc-e2e.yml actually
-#      coming back green for this exact commit, not just a locally-clean self-check.
+#      coming back green for this exact commit, not just a locally-clean self-check. For
+#      MODE=apply-review specifically, "implemented" with nothing actually changed (every
+#      review comment was praise, already addressed, or out of scope) is a legitimate,
+#      non-error outcome — see the commit step's own comment.
 #   8. Any failure from step 2 onward: tag "needs human" + comment with the run URL, same
 #      generic catch-all as agent-propose.yml.
 
 on:
   repository_dispatch:
-    types: [clickup-implement]
+    types: [clickup-implement, clickup-apply-review]
   workflow_dispatch:
     inputs:
       ticket_id:
         description: ClickUp ticket id (for a manual re-run after a blocked/failed run)
         required: true
+      mode:
+        description: 'implement (default) or apply-review, for a manual re-run'
+        required: false
+        default: implement
 
 concurrency:
   group: agent-implement-${{ github.event.client_payload.ticket_id || inputs.ticket_id }}
@@ -81,6 +101,12 @@ permissions:
 
 env:
   TICKET_ID: ${{ github.event.client_payload.ticket_id || inputs.ticket_id }}
+  # 'implement' (fresh ticket or e2e-fix retry, both handled by prompts/implement.md) or
+  # 'apply-review' (a human re-added for-ai at "in review", handled by
+  # prompts/apply-review.md). Derived from the dispatching event_type, same a || b style
+  # as TICKET_ID above — github.event.action carries the event_type for a
+  # repository_dispatch run (empty for workflow_dispatch, where inputs.mode covers it).
+  MODE: ${{ (github.event.action == 'clickup-apply-review') && 'apply-review' || inputs.mode || 'implement' }}
   # Both optional — only set when agent-react-to-e2e.yml re-dispatches this same event
   # type after a red e2e result. Job-level (not step-local), same as TICKET_ID, so every
   # step that needs them references $CI_FAILURE/$ATTEMPT_NUMBER rather than any step
@@ -153,16 +179,28 @@ jobs:
 
       - name: Capture the implement prompt
         # Must happen BEFORE the branch switch below, and land outside the repo checkout
-        # (RUNNER_TEMP, not a repo-relative path): prompts/implement.md lives on develop
-        # (this is the ref actions/checkout just fetched, for a repository_dispatch run),
-        # not necessarily on poc/<ticket_id> — that branch is whatever agent-propose.yml
-        # committed at propose-time, which can predate any later addition or edit to this
-        # file on develop. `git checkout -B` two steps from now is a full ref switch: it
-        # deletes any tracked file the target branch doesn't have. Reading the prompt
-        # from a path inside the repo AFTER that switch would silently read whatever
-        # (possibly nonexistent, possibly stale) version poc/<ticket_id> happens to carry,
-        # instead of the pipeline's actual current contract.
-        run: cp prompts/implement.md "${RUNNER_TEMP}/implement-prompt.md"
+        # (RUNNER_TEMP, not a repo-relative path): the prompt files live on develop (the
+        # ref actions/checkout just fetched, for a repository_dispatch run), not
+        # necessarily on poc/<ticket_id> — that branch is whatever agent-propose.yml
+        # committed at propose-time, which can predate any later addition or edit to
+        # either file on develop. `git checkout -B` two steps from now is a full ref
+        # switch: it deletes any tracked file the target branch doesn't have. Reading the
+        # prompt from a path inside the repo AFTER that switch would silently read
+        # whatever (possibly nonexistent, possibly stale) version poc/<ticket_id> happens
+        # to carry, instead of the pipeline's actual current contract.
+        #
+        # Source file picked by MODE; destination path is the same either way, so nothing
+        # downstream (the "Run the implement agent" step) needs to know which one it is.
+        run: |
+          set -euo pipefail
+
+          if [ "$MODE" = "apply-review" ]; then
+            source_prompt="prompts/apply-review.md"
+          else
+            source_prompt="prompts/implement.md"
+          fi
+
+          cp "$source_prompt" "${RUNNER_TEMP}/implement-prompt.md"
 
       - name: Check out the existing implementation branch
         run: |
@@ -183,6 +221,46 @@ jobs:
           fi
 
           git checkout -B "$branch" "origin/$branch"
+
+      - name: Fetch review comments, if this is an apply-review dispatch
+        if: env.MODE == 'apply-review'
+        env:
+          # A new secret usage in this workflow — every other step so far only needs
+          # CLICKUP_API_TOKEN/ANTHROPIC_API_KEY. Same DISPATCH_PAT every gh pr call in
+          # this pipeline already uses; unverified specifically for a read-only `gh pr
+          # view` (the "GITHUB_TOKEN blocked from PR operations" finding was confirmed for
+          # writes — create/ready/review — not reconfirmed for this), used regardless per
+          # the same reasoning, worth reconfirming on the first real run rather than
+          # asserting certainty this doesn't have.
+          GH_TOKEN: ${{ secrets.DISPATCH_PAT }}
+        run: |
+          set -euo pipefail
+
+          reviews_json=$(gh pr view "poc/${TICKET_ID}" --json reviews -R "${{ github.repository }}")
+
+          # Every review round, not just the latest — a second round should still carry
+          # the first round's context. `|| true` + explicit empty check, not relying on
+          # jq's own exit code: an empty result here is a real, expected-to-be-caught
+          # case (a human re-tagged for-ai without ever leaving a review), not a script
+          # bug, and a bare assignment on a `jq | ...` pipeline would abort the step under
+          # the externally active `bash -e` before the check below ever ran.
+          body=$(echo "$reviews_json" | jq -r '
+            [.reviews[] | select(.body != "")]
+            | map("### \(.author.login) (\(.state)) — \(.submittedAt)\n\n\(.body)")
+            | join("\n\n---\n\n")
+          ') || true
+
+          if [ -z "$body" ]; then
+            reason="No PR review found on poc/${TICKET_ID} — nothing to apply. (for-ai may have been re-added without leaving a review comment first.)"
+            echo "::error::${reason}"
+            echo "$reason" > "${RUNNER_TEMP}/failure-reason.txt"
+            exit 1
+          fi
+
+          printf '%s\n' "$body" > .review-comments.md
+          echo ".review-comments.md" >> .git/info/exclude
+
+          echo "Wrote .review-comments.md ($(echo "$reviews_json" | jq '[.reviews[] | select(.body != "")] | length') review(s))."
 
       - name: Write CI failure context, if this is a retry
         if: env.CI_FAILURE != ''
@@ -403,11 +481,25 @@ jobs:
               || echo "::warning::push of WIP progress failed — continuing with status revert and tagging anyway"
           fi
 
-          # Revert to "ready for dev" — same shape as agent-propose.yml reverting
-          # insufficient-detail tickets to "in spec". Safe here specifically because the
-          # "implement-blocked" tag below keeps poll-clickup-implement.yml from picking
-          # this ticket straight back up.
-          status_payload=$(jq -n '{status: "ready for dev"}')
+          # Revert target depends on MODE: a fresh implement run reverts to "ready for
+          # dev" (same shape as agent-propose.yml reverting insufficient-detail tickets to
+          # "in spec"), safe there because the "implement-blocked" tag below keeps
+          # poll-clickup-implement.yml from picking it straight back up. An apply-review
+          # run reverts to "in review" instead — this ticket already went through review;
+          # sending it all the way back to "ready for dev" would skip past that. No
+          # equivalent exclusion tag is needed there: this run's own lock step already
+          # consumed "for-ai" before Claude ever ran, so the ticket is already un-pollable
+          # by poll-clickup-apply-review.yml the moment it blocks — a human has to
+          # deliberately re-add "for-ai" to retry either way.
+          if [ "$MODE" = "apply-review" ]; then
+            revert_status="in review"
+            action_desc="Applying review feedback"
+          else
+            revert_status="ready for dev"
+            action_desc="Implementation"
+          fi
+
+          status_payload=$(jq -n --arg s "$revert_status" '{status: $s}')
           http_code=$(curl -sS -o "${RUNNER_TEMP}/revert-response.json" -w '%{http_code}' \
             -X PUT \
             -H "Authorization: ${CLICKUP_API_TOKEN}" \
@@ -416,10 +508,10 @@ jobs:
             -d "$status_payload" || true)
 
           if [ "$http_code" -lt 200 ] || [ "$http_code" -ge 300 ]; then
-            echo "::error::ClickUp PUT status (revert to ready for dev) returned HTTP ${http_code}"
+            echo "::error::ClickUp PUT status (revert to ${revert_status}) returned HTTP ${http_code}"
             cat "${RUNNER_TEMP}/revert-response.json"
             {
-              echo "ClickUp PUT status (revert to ready for dev) returned HTTP ${http_code}."
+              echo "ClickUp PUT status (revert to ${revert_status}) returned HTTP ${http_code}."
               echo
               cat "${RUNNER_TEMP}/revert-response.json"
             } > "${RUNNER_TEMP}/failure-reason.txt"
@@ -434,13 +526,28 @@ jobs:
             -H "Authorization: ${CLICKUP_API_TOKEN}" \
             "https://api.clickup.com/api/v2/task/${TICKET_ID}/tag/needs-human" || true
 
-          curl -sS -o /dev/null -w 'tag implement-blocked: %{http_code}\n' \
-            -X POST \
-            -H "Authorization: ${CLICKUP_API_TOKEN}" \
-            "https://api.clickup.com/api/v2/task/${TICKET_ID}/tag/implement-blocked" || true
+          # implement-blocked exists specifically to stop poll-clickup-implement.yml from
+          # immediately re-dispatching into the same blocker — see header comment. Not
+          # needed for apply-review (see the revert-target comment above for why).
+          if [ "$MODE" != "apply-review" ]; then
+            curl -sS -o /dev/null -w 'tag implement-blocked: %{http_code}\n' \
+              -X POST \
+              -H "Authorization: ${CLICKUP_API_TOKEN}" \
+              "https://api.clickup.com/api/v2/task/${TICKET_ID}/tag/implement-blocked" || true
+          fi
 
-          comment_text=$(printf 'Implementation blocked (%s tasks done) — reasoning below.\n\n%s' \
-            "$TASKS" \
+          # TASKS is only meaningful for MODE=implement — apply-review.md's contract has
+          # no TASKS: line (see prompts/apply-review.md), so $TASKS is empty there; the
+          # progress fragment is omitted rather than printed as "( tasks done)".
+          if [ -n "$TASKS" ]; then
+            progress_fragment=" (${TASKS} tasks done)"
+          else
+            progress_fragment=""
+          fi
+
+          comment_text=$(printf '%s blocked%s — reasoning below.\n\n%s' \
+            "$action_desc" \
+            "$progress_fragment" \
             "$(tail -c 3000 "${RUNNER_TEMP}/claude-output.txt")")
 
           # comment, via the same markdown-to-clickup-comment.mjs conversion
@@ -467,7 +574,7 @@ jobs:
             exit 1
           fi
 
-          echo "Ticket ${TICKET_ID}: implementation blocked — reverted to \"ready for dev\", tagged, commented."
+          echo "Ticket ${TICKET_ID}: ${action_desc,,} blocked — reverted to \"${revert_status}\", tagged, commented."
 
       - name: Self-check the implementation (lint, typecheck, build)
         id: selfcheck
@@ -578,6 +685,8 @@ jobs:
         # tag's removal is the human's own unblock signal (see
         # poll-clickup-implement.yml's header comment), not something this workflow
         # infers from a later run merely completing.
+        env:
+          CLICKUP_API_TOKEN: ${{ secrets.CLICKUP_API_TOKEN }}
         run: |
           set -uo pipefail
 
@@ -598,15 +707,66 @@ jobs:
             echo "$output"
           }
 
+          # MODE=apply-review, and nothing actually changed: a legitimate outcome (see
+          # prompts/apply-review.md — praise, already-addressed, or out-of-scope comments
+          # need no code change), not the MODE=implement anomaly it would be otherwise
+          # (that path always writes at minimum the failing spec file, so an empty diff
+          # there means something is genuinely wrong — left to fail below as it already
+          # does). `git commit` on a clean tree just fails, which would wrongly trip the
+          # generic catch-all; handle it explicitly instead. Nothing was pushed, so
+          # there's no new commit for e2e to re-verify — the ticket's last real green
+          # result still stands, and it goes straight back to "ready for review" rather
+          # than sitting at "in progress" forever with nothing to move it. No `gh pr
+          # ready` needed: the PR was already out of draft by the time this ticket
+          # reached review.
+          if [ "$MODE" = "apply-review" ] && [ -z "$(git status --porcelain)" ]; then
+            status_payload=$(jq -n '{status: "ready for review"}')
+            http_code=$(curl -sS -o "${RUNNER_TEMP}/noop-status-response.json" -w '%{http_code}' \
+              -X PUT \
+              -H "Authorization: ${CLICKUP_API_TOKEN}" \
+              -H "Content-Type: application/json" \
+              "https://api.clickup.com/api/v2/task/${TICKET_ID}" \
+              -d "$status_payload" || true)
+
+            if [ "$http_code" -lt 200 ] || [ "$http_code" -ge 300 ]; then
+              echo "::error::ClickUp PUT status (ready for review, no-op apply-review) returned HTTP ${http_code}"
+              cat "${RUNNER_TEMP}/noop-status-response.json"
+              {
+                echo "ClickUp PUT status (ready for review, no-op apply-review) returned HTTP ${http_code}."
+                echo
+                cat "${RUNNER_TEMP}/noop-status-response.json"
+              } > "${RUNNER_TEMP}/failure-reason.txt"
+              exit 1
+            fi
+
+            comment_text=$(printf 'Review feedback required no code changes — PR unchanged, back to "ready for review".\n\n%s' \
+              "$(tail -c 3000 "${RUNNER_TEMP}/claude-output.txt")")
+            comment_blocks=$(printf '%s' "$comment_text" | node .github/scripts/markdown-to-clickup-comment.mjs)
+            comment_payload=$(jq -n --argjson c "$comment_blocks" '{comment: $c, notify_all: false}')
+            curl -sS -o /dev/null -w 'comment: %{http_code}\n' \
+              -X POST \
+              -H "Authorization: ${CLICKUP_API_TOKEN}" \
+              -H "Content-Type: application/json" \
+              "https://api.clickup.com/api/v2/task/${TICKET_ID}/comment" \
+              -d "$comment_payload" || true
+
+            echo "Ticket ${TICKET_ID}: apply-review made no changes — moved straight back to \"ready for review\"."
+            exit 0
+          fi
+
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
           # Retry runs (CI_FAILURE set) get a distinct, greppable commit prefix —
           # agent-react-to-e2e.yml counts prior occurrences of it on this branch to
           # enforce MAX_E2E_RETRIES, so the exact wording here is load-bearing, not
-          # cosmetic.
+          # cosmetic. CI_FAILURE always wins if somehow both it and MODE=apply-review were
+          # set (can't currently happen — see header comment — but the precedence should
+          # still be unambiguous if it ever did).
           if [ -n "$CI_FAILURE" ]; then
             commit_message="Fix e2e failure: ${TICKET_ID} (attempt ${ATTEMPT_NUMBER})"
+          elif [ "$MODE" = "apply-review" ]; then
+            commit_message="Address review feedback: ${TICKET_ID}"
           else
             commit_message="Implement ${TICKET_ID}"
           fi
