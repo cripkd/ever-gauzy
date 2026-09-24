@@ -10,12 +10,18 @@ name: Poll ClickUp Implement
 # statuses[]=ready%20for%20dev filter. A ticket can't be re-dispatched once a run has
 # claimed it, without this poller needing to know anything about that lock directly.
 #
-# One extra filter beyond that: tasks tagged "implement-blocked" are dropped client-side
-# after the fetch (ClickUp's own statuses[] filter has no tag-exclusion equivalent).
-# agent-implement.yml applies that tag and reverts status back to "ready for dev" when a
-# run stops rather than guessing — without this filter, the very next poll cycle would
-# immediately re-dispatch that same ticket into the same blocker. A human removing the
-# tag is what makes a previously-blocked ticket pollable again.
+# Two extra filters beyond that, both client-side after the fetch (ClickUp's own
+# statuses[] filter has no tag-inclusion/exclusion equivalent):
+#   - Requires the "for-ai" tag, same as every other poller in this pipeline: a human
+#     adds it to hand a ticket to automation at this stage; without it, the ticket sits
+#     untouched and a human can work it locally instead. Checked fresh on every poll,
+#     not just once, so a ticket can move between manual and automated handling at any
+#     stage.
+#   - Drops tasks tagged "implement-blocked". agent-implement.yml applies that tag and
+#     reverts status back to "ready for dev" when a run stops rather than guessing —
+#     without this filter, the very next poll cycle would immediately re-dispatch that
+#     same ticket into the same blocker. A human removing the tag is what makes a
+#     previously-blocked ticket pollable again.
 #
 # This workflow never writes to ClickUp — only reads, then dispatches via the GitHub API.
 
@@ -84,17 +90,21 @@ jobs:
             exit 1
           fi
 
-          # Drop anything tagged "implement-blocked" — agent-implement.yml applies that
-          # tag when a run stops rather than guessing, and reverts the ticket right back
-          # to "ready for dev" when it does. Without this filter, the very next poll cycle
-          # would immediately re-dispatch the same ticket into the same blocker, forever,
-          # until a human removes the tag. That removal is the actual unblock signal.
-          jq '.tasks |= map(select(([.tags[]?.name] | index("implement-blocked")) == null))' \
+          # Requires "for-ai"; drops anything tagged "implement-blocked" — see header
+          # comment for both. agent-implement.yml applies implement-blocked when a run
+          # stops rather than guessing, and reverts the ticket right back to "ready for
+          # dev" when it does; without this filter, the very next poll cycle would
+          # immediately re-dispatch the same ticket into the same blocker, forever, until
+          # a human removes the tag. That removal is the actual unblock signal.
+          jq '.tasks |= map(select(
+                (((.tags // []) | map(.name) | any(. == "for-ai")))
+                and (([.tags[]?.name] | index("implement-blocked")) == null)
+              ))' \
             clickup-tasks.json > clickup-tasks-filtered.json
           mv clickup-tasks-filtered.json clickup-tasks.json
 
           matched=$(jq '.tasks | length' clickup-tasks.json)
-          echo "Tasks ready for dev (excluding implement-blocked): ${matched}"
+          echo "Tasks ready for dev (tagged for-ai, excluding implement-blocked): ${matched}"
           echo "matched=${matched}" >> "$GITHUB_OUTPUT"
 
       - name: Exit quietly if nothing to do

@@ -12,6 +12,11 @@ name: Poll ClickUp Intake
 # dispatching the same task again next cycle. No other bookkeeping is needed, and
 # this workflow never writes anything back to ClickUp itself — it only reads.
 #
+# Also requires the "for-ai" tag, same as every other poller in this pipeline: a human
+# adds it to hand a ticket to automation at this stage; without it, the ticket sits
+# untouched and a human can work it locally instead. Checked fresh on every poll, not
+# just once, so a ticket can move between manual and automated handling at any stage.
+#
 # Known limitation: this calls the ClickUp list-tasks endpoint once per run, with no
 # pagination. Fine for a POC-sized list; a list large enough to paginate would need a
 # follow-up here.
@@ -65,7 +70,9 @@ jobs:
 
           # A task matches when its custom_fields entry for ORIGINAL_REPORT_FIELD_ID is
           # missing entirely, has no "value" key, has a null value, or has a
-          # whitespace-only string value. Anything else counts as "already populated".
+          # whitespace-only string value (anything else counts as "already populated"),
+          # AND it carries the "for-ai" tag (a human's explicit opt-in for this ticket to
+          # be handled by automation at this stage).
           jq -r --arg fid "$ORIGINAL_REPORT_FIELD_ID" '
             .tasks[]
             | . as $task
@@ -76,6 +83,7 @@ jobs:
                 or ($field.value == null)
                 or (($field.value | type) == "string" and ($field.value | test("^\\s*$")))
               )
+            | select(($task.tags // []) | map(.name) | any(. == "for-ai"))
             | $task.id
           ' clickup-tasks.json > matched-ids.txt
 
@@ -83,7 +91,7 @@ jobs:
           matched=$(wc -l < matched-ids.txt | tr -d ' ')
 
           echo "Tasks in list: ${total_in_list}"
-          echo "Tasks needing the DoR-rewrite agent: ${matched}"
+          echo "Tasks needing the DoR-rewrite agent (tagged for-ai): ${matched}"
 
           echo "matched=${matched}" >> "$GITHUB_OUTPUT"
 
