@@ -8,57 +8,115 @@ happen.
 ## The seven stages
 
 Same seven for both lanes. Bugs and features differ only in the wording
-of the stage 3 gate.
+of the stage 3 gate. Built as GitHub Actions cron pollers (find eligible
+tickets, dispatch) paired with `repository_dispatch` agents (do the work) —
+see [Mechanism](#mechanism-what-actually-runs-this) below for why, and why
+that's a real departure from the MCP-driven model this table originally
+assumed.
 
-| #   | Stage        | Who                      | Artifact out                             | Exit gate                                                         | Decided by     | Tools needed                             |
-| --- | ------------ | ------------------------ | ---------------------------------------- | ----------------------------------------------------------------- | -------------- | ---------------------------------------- |
-| 1   | Intake       | Agent drafts, you decide | Ticket meeting DoR, priority set         | DoR checklist complete, priority approved                         | **Human**      | ClickUp MCP                              |
-| 2   | Spec         | Agent                    | OpenSpec change (delta + tasks)          | `openspec validate --strict` green, then you approve the proposal | CI + **Human** | OpenSpec CLI                             |
-| 3   | Failing test | Agent                    | Committed `.spec.ts`, no production code | Test red at this commit, for the stated reason                    | CI             | Playwright MCP (optional, for exploring) |
-| 4   | Implement    | Agent                    | Branch, code, `data-testid`s             | Lint, typecheck, build pass                                       | CI             | —                                        |
-| 5   | Verify       | Agent                    | PR with run evidence                     | Whole suite green on the PR merge commit                          | CI             | GitHub MCP                               |
-| 6   | Review       | AI reviewer, then you    | Comments, approval                       | Your approval                                                     | **Human**      | GitHub MCP                               |
-| 7   | Merge        | Agent                    | Merged PR, archived OpenSpec change      | `openspec validate --archived`, smoke run on main                 | CI             | GitHub MCP                               |
+| #   | Stage             | Mechanism                                                  | ClickUp status change                       | Artifact out                                              | Exit gate                                                                    | Decided by     |
+| --- | ----------------- | ----------------------------------------------------------- | -------------------------------------------- | ----------------------------------------------------------- | ----------------------------------------------------------------------------- | -------------- |
+| 1   | Intake            | `poll-clickup-intake.yml` → `agent-intake.yml`               | `to do` → `in spec`                          | Ticket rewritten to DoR form                               | DoR checklist complete; human sets priority and moves to `ready for spec`    | **Human**      |
+| 2   | Spec              | `poll-clickup-propose.yml` → `agent-propose.yml`             | `ready for spec` → `spec proposed`           | OpenSpec change (proposal + spec delta + tasks) + draft PR | `openspec validate --strict` green, then you approve and move to `ready for dev` | CI + **Human** |
+| 3+4 | Failing test + Implement (one agent — see note) | `poll-clickup-implement.yml` → `agent-implement.yml`         | `ready for dev` → `in progress`              | Branch pushed: failing spec + implementation together      | Self-check (lint/typecheck/build, scoped to directly-touched projects) passes | CI             |
+| 5   | Verify            | `poc-e2e.yml` (CI) → `agent-react-to-e2e.yml` (reacts)       | `in progress` → `ready for review` (on green) | PR undrafted; screenshots/trace/HTML report on failure     | Whole accumulated Playwright suite green, for the exact pushed commit         | CI             |
+| 6   | Review            | `poll-clickup-review.yml` → `agent-review.yml`               | `ready for review` → `in review`             | GitHub PR review (AI-authored comments)                    | Review posted; you decide                                                   | **Human**      |
+| 7   | Merge             | **Not built yet**                                           | `in review` → `ready for deploy` → `complete`| —                                                            | —                                                                             | —              |
+
+**Note on stage 3+4:** `propose.md` still writes `tasks.md` with task 1 as
+the failing Playwright spec, ordered first, same as always — but
+`agent-implement.yml` no longer commits it as a separate, isolated red
+commit before continuing. Everything (spec + implementation) goes out in
+one push. A deliberate simplification, not an oversight — CI never sees an
+intermediate red run on this branch, only the final state.
 
 ### Stage 3 lane difference
 
 - **Bug** — red for the symptom the ticket describes
 - **Feature** — red because the behaviour does not exist yet
 
-Both lanes: test committed before any production code. A test that was
-never red proves nothing, which is what makes stage 5 mean something.
+Both lanes: the failing spec is written before the fix, in the same task
+ordering as always. A test that was never red proves nothing, which is
+what makes stage 5 mean something.
 
 ### Stage 5 contents
 
-One CI run on the PR merge commit:
+`poc-e2e.yml`, triggered on every push to a `poc/<ticket_id>` branch:
 
-- lint, typecheck, build (changed paths)
-- unit / integration for touched code
+- lint, typecheck, build (handled separately, by stage 3+4's own
+  self-check — not part of this CI run)
 - the entire Playwright suite — new spec plus every spec from every
   previous run
 
 No separate regression gate. The accumulated suite _is_ the regression
-run. Two outcomes reported separately in the log:
+run. Two outcomes, classified by `agent-react-to-e2e.yml` when it reacts
+to a red result and decides what context to hand back for a retry:
 
 - new test red → agent did not do the task
 - new test green, older tests red → collateral breakage
 
+A failure with no evident connection to the ticket's own changed files
+(a pre-existing flake) isn't distinguished from either case today —
+flaky-test triage is its own discipline, out of scope for now.
+
 ---
 
-## Tools — what each is actually for
+## Mechanism — what actually runs this
 
-| Tool           | Where it runs | Needed for                                    | Load-bearing?                           |
-| -------------- | ------------- | --------------------------------------------- | --------------------------------------- |
-| ClickUp MCP    | Claude Code   | Reading/writing tickets, stages 1–2           | Yes                                     |
-| GitHub MCP     | Claude Code   | PR creation, reading Actions runs, stages 5–7 | Yes                                     |
-| Playwright MCP | Claude Code   | Driving a live browser while authoring a test | No — gate runs committed specs via `nx` |
-| Nx MCP         | Claude Code   | Project graph, "what does this change affect" | No — matters from Step 3                |
-| OpenSpec       | CLI in repo   | Stage 2 and 7 validation                      | Yes                                     |
+**Not MCP-driven.** The original plan here was Claude Code sessions using
+ClickUp MCP, GitHub MCP, Playwright MCP, and Nx MCP interactively. What got
+built instead, deliberately, across every agent workflow: plain `curl`
+against the ClickUp REST API and the `gh` CLI against GitHub, run as
+ordinary deterministic bash inside GitHub Actions — Claude never holds a
+ClickUp or GitHub credential, and never touches either directly. Claude's
+own role is scoped tightly per agent via `--allowed-tools`, run headless
+(`claude -p`, no interactive session) with a fixed, explicit prompt file
+under `prompts/`. What each agent's Claude invocation is actually allowed
+to do:
 
-MCPs for Claude Code are configured from the terminal, not the desktop
-app: `claude mcp add --transport http --scope project <name> <url>`.
-`--scope project` writes `.mcp.json` into the repo so the config is
-versioned. `/mcp` inside a session shows status.
+| Agent               | `--allowed-tools`                                                          | Notably absent                          |
+| ------------------- | ---------------------------------------------------------------------------- | ---------------------------------------- |
+| `agent-intake.yml`    | `Read,Write` (isolated scratch dir, not the repo)                          | Bash, network, the repo itself           |
+| `agent-propose.yml`   | `Read,Write,Edit,Glob,Grep,Bash(openspec:*)`                               | git, any other Bash                     |
+| `agent-implement.yml` | `Read,Write,Edit,Glob,Grep,Bash(openspec:*)`                               | git, test/build commands, Plan Mode      |
+| `agent-review.yml`    | `Read,Grep,Glob,Skill,Task,Bash(git diff/log/show:*)`                      | Write, Edit, any GitHub/ClickUp access  |
+
+Every commit, push, PR operation, and ClickUp write happens in the
+workflow's own bash, after Claude exits — a human-auditable script sits
+between "Claude decided X" and "GitHub/ClickUp actually got written to,"
+always.
+
+**The `for-ai` tag** is the human opt-in gate, checked fresh by every
+poller before it dispatches, and consumed (removed) by every agent the
+moment its own dispatch lock succeeds. One tag, but single-use per stage —
+tagging a ticket doesn't authorize the whole pipeline end-to-end, only the
+next stage that's about to check for it. A human re-adds it deliberately
+whenever they want the *next* stage to also run automatically; leaving it
+off means a ticket just sits at its current status for a human to work by
+hand. `agent-react-to-e2e.yml` is the one exception — it doesn't check
+`for-ai` at all, because reacting to an e2e result isn't a new gate, it's
+the automatic continuation of whatever implement run already got
+authorized and pushed.
+
+**Failure tags:** `needs-human` (generic — any agent's own catch-all, on
+any unexpected failure) and `implement-blocked` (stage-3+4-specific —
+set when `agent-implement.yml` stops rather than guess; also reverts
+status to `ready for dev`, and is what keeps the poller from immediately
+re-dispatching into the same blocker).
+
+**Live ClickUp status chain** (confirmed against the actual list, not
+assumed):
+
+```
+to do → in spec → ready for spec → spec proposed → ready for dev →
+in progress → ready for review → in review → ready for deploy → complete
+```
+
+**OpenSpec CLI** — still load-bearing, unchanged from the original plan:
+`agent-propose.yml` runs `openspec validate --strict`; every agent that
+needs a change's artifacts resolves it via `openspec/changes/*` directly
+(a plain directory listing, not the CLI) rather than installing the CLI
+in workflows that never run it.
 
 ---
 
@@ -82,26 +140,31 @@ Done. Stages, gates, run-log schema, deferred decisions with triggers.
 | Bug task type + Source custom field                                         | Done                            |
 | DoR templates in `docs/poc/templates/`                                      | Done                            |
 | `CLAUDE.md` seeded                                                          | Done                            |
-| `openspec init`                                                             | Open                            |
-| ClickUp + GitHub MCPs verified in Claude Code                               | Open                            |
+| `openspec init`                                                             | Done                            |
+| ClickUp + GitHub MCPs verified in Claude Code                               | **N/A — superseded.** Pipeline automation deliberately never uses MCP; see [Mechanism](#mechanism-what-actually-runs-this). |
 
 ### Step 2 — walking skeleton
 
-Not started. One trivial change through all seven stages, each invoked
-by hand. Once as a feature, once as a synthetic bug.
+Superseded by building full automation directly (stages 1–6) rather than
+one manual, by-hand walkthrough. Ticket `869f5qg9d` (a real,
+replayed-closed bug — task creation not assigning the creating employee)
+is the live end-to-end exercise instead: intake and spec done, implement
+done, e2e verification in progress (including one real retry cycle after
+a self-check OOM was found and fixed), review not yet reached, stage 7
+not built.
 
 ---
 
 ## Known, deferred, with triggers
 
-| Item                                                                                                                                                                    | Trigger to revisit                                                                                             |
+| Item                                                                                                                                                                    | Status / trigger to revisit                                                                             |
 | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------- |
-| CI bring-up: 24 of 34 min is dependency install. `node_modules` is 11.9 GB / 985k files, so the Actions cache (10 GB limit) is not viable. Prebuilt image is the lever. | Step 4 — it is measured and annoying                                                                           |
+| CI bring-up: 24 of 34 min is dependency install. `node_modules` is 11.9 GB / 985k files, so the Actions cache (10 GB limit) is not viable as a raw directory. | **Partially addressed.** `agent-implement.yml` and `poc-e2e.yml` share one compressed archive via Actions cache (compression brings it under the 10 GB cap on a hit). A cache miss is still a full 1–3h bootstrap — unresolved. |
+| `nx affected` / changed-path gating                                                                                                                                     | **Partially done, narrower than originally scoped.** `agent-implement.yml`'s self-check resolves only the project(s) directly containing the ticket's own changed files, not `nx affected`'s full dependent graph — found necessary after a real run touching `packages/core` computed 74 affected projects and OOM'd a standard runner. Changed-path gating for `poc-e2e.yml` itself is still open. |
 | Speed-tiered pipeline                                                                                                                                                   | PR run > ~10 min _and_ being routed around                                                                     |
-| `nx affected` / changed-path gating                                                                                                                                     | No upstream implementation to copy; build when the suite is big enough to matter                               |
 | Postgres instead of sqlite                                                                                                                                              | Step 3 surfaces migration/transaction/concurrency bugs                                                         |
 | Step 3 corpus: replayed-closed vs open issues                                                                                                                           | Before building the corpus. Forked from current `develop`, so most closed issues are already fixed in the tree |
-| ClickUp status ↔ pipeline stage mapping (`qa` sits before `in review` in ClickUp; CI verify is stage 5 and review is stage 6)                                           | Before Step 2 run 1, or `stage_reached` won't line up                                                          |
+| ClickUp status ↔ pipeline stage mapping                                                                                                                                 | **Done** — live chain confirmed and recorded above; `ready for review` added this round specifically to give stage 5 a landing status distinct from `in review`. |
 
 ---
 
