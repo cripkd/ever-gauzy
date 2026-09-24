@@ -1,0 +1,355 @@
+name: Agent Review
+
+# Fires once per clickup-review dispatch from poll-clickup-review.yml. Reviews one
+# ticket's implementation — the diff on its poc/<ticket_id> branch against develop,
+# already verified green by the e2e feedback loop — using the superpowers plugin's
+# requesting-code-review skill, and posts the result as an actual GitHub PR review. See
+# prompts/review.md for Claude's exact contract.
+#
+# Flow:
+#   1. PUT status -> in review, FIRST action, before checkout. Dispatch lock, same
+#      reasoning as every other stage: poll-clickup-review.yml only ever queries
+#      statuses[]=ready%20for%20review, so a ticket moved out of that status can't be
+#      re-dispatched by a later poll cycle. Immediately after: DELETE the "for-ai" tag.
+#      This is not cleanup — it closes a real gap. If "for-ai" just carried over
+#      unchanged from propose/implement, the moment this ticket reaches "in review" a
+#      later apply-fix poller (watching in review + for-ai, not built yet) would fire
+#      before any human read a single comment. Removing it here means a human has to
+#      deliberately re-add it at "in review" to signal "let AI apply these fixes" — an
+#      explicit decision, not an inherited leftover from an earlier stage.
+#   2. Full checkout (fetch-depth: 0), capture prompts/review.md to RUNNER_TEMP BEFORE
+#      switching branches (same reason agent-implement.yml already does this for its own
+#      prompt: prompts/review.md is brand new today, so it predates every existing
+#      ticket branch — reading it after the branch switch would silently find nothing),
+#      then fetch + check out the EXISTING poc/<ticket_id> branch (never created here — a
+#      ticket can't reach "ready for review" without having gone through implement and a
+#      green e2e run first).
+#   3. Resolve the one OpenSpec change on this branch via a plain directory listing
+#      (openspec/changes/*, excluding archive) — no CLI installed for this workflow at
+#      all: unlike propose/implement, review never runs an `openspec` command, it only
+#      reads the change's own files directly.
+#   4. Write the ticket's description to ticket.md (git-ignored locally), same
+#      supplementary-context pattern as implement/propose.
+#   5. Install Claude Code, then the superpowers plugin (`claude plugin install
+#      superpowers@claude-plugins-official` — already in the default marketplace,
+#      verified directly earlier; no `marketplace add` needed). No node_modules restore
+#      at all: this workflow never builds, lints, or runs anything, only reads source and
+#      diffs via git, so the dependency bring-up agent-implement.yml needs simply doesn't
+#      apply here — meaningfully lighter and faster than an implement run.
+#   6. claude -p, model pinned via CLAUDE_MODEL, --allowed-tools
+#      "Read,Grep,Glob,Skill,Task,Bash(git diff:*),Bash(git log:*),Bash(git show:*)".
+#      Read-only: Claude never commits, pushes, or touches the PR/ClickUp directly — the
+#      workflow posts whatever it prints after it exits. Task is included for the
+#      requesting-code-review skill's own subagent-driven review; unverified whether it
+#      actually needs it headlessly — first real run confirms this one way or the other.
+#   7. Post the review as an actual GitHub PR review (`gh pr review --comment`, not a
+#      plain issue comment — the correct semantic fit, and what shows up in the PR's
+#      Reviews section same as a human reviewer's would), then a short ClickUp comment
+#      pointing at it. GH_TOKEN: DISPATCH_PAT, same reasoning as every other gh pr call
+#      in this pipeline (this fork blocks GITHUB_TOKEN from PR operations, confirmed on a
+#      real run for gh pr create/gh pr ready — not independently reconfirmed here for gh
+#      pr review specifically, but used regardless per the same reasoning).
+#   8. Any failure from step 2 onward: tag "needs human" + comment with the run URL, same
+#      generic catch-all as every other agent in this pipeline. No rollback of the
+#      status/tag change from step 1 on failure — consistent with how every other stage's
+#      dispatch lock already behaves: once locked, a failure gets flagged, not undone.
+
+on:
+  repository_dispatch:
+    types: [clickup-review]
+  workflow_dispatch:
+    inputs:
+      ticket_id:
+        description: ClickUp ticket id (for a manual re-run after a failed run)
+        required: true
+
+concurrency:
+  group: agent-review-${{ github.event.client_payload.ticket_id || inputs.ticket_id }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  TICKET_ID: ${{ github.event.client_payload.ticket_id || inputs.ticket_id }}
+  CLAUDE_MODEL: ${{ vars.CLAUDE_MODEL }}
+
+jobs:
+  review:
+    name: Review a ticket's implementation
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Move task to in review, remove for-ai (dispatch lock)
+        id: lock
+        env:
+          CLICKUP_API_TOKEN: ${{ secrets.CLICKUP_API_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          payload=$(jq -n '{status: "in review"}')
+
+          http_code=$(curl -sS -o "${RUNNER_TEMP}/lock-response.json" -w '%{http_code}' \
+            -X PUT \
+            -H "Authorization: ${CLICKUP_API_TOKEN}" \
+            -H "Content-Type: application/json" \
+            "https://api.clickup.com/api/v2/task/${TICKET_ID}" \
+            -d "$payload")
+
+          if [ "$http_code" -lt 200 ] || [ "$http_code" -ge 300 ]; then
+            echo "::error::ClickUp PUT status returned HTTP ${http_code} — could not acquire the dispatch lock, stopping."
+            cat "${RUNNER_TEMP}/lock-response.json"
+            exit 1
+          fi
+
+          echo "Ticket ${TICKET_ID}: moved to \"in review\"."
+
+          # Best-effort, not gated on http_code the way the status PUT above is: the lock
+          # itself already succeeded by this point, and no apply-fix poller exists yet to
+          # act on a stale "for-ai" tag anyway (see header comment) — this closes a gap
+          # for a later piece, it doesn't protect anything in THIS run.
+          tag_remove_code=$(curl -sS -o /dev/null -w '%{http_code}' \
+            -X DELETE \
+            -H "Authorization: ${CLICKUP_API_TOKEN}" \
+            "https://api.clickup.com/api/v2/task/${TICKET_ID}/tag/for-ai" || true)
+          echo "Ticket ${TICKET_ID}: removed \"for-ai\" tag (HTTP ${tag_remove_code})."
+
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Capture the review prompt
+        # Must happen BEFORE the branch switch below, and land outside the repo checkout
+        # — same reasoning as agent-implement.yml's identical step: prompts/review.md is
+        # brand new today, so it predates every ticket branch that currently exists.
+        run: cp prompts/review.md "${RUNNER_TEMP}/review-prompt.md"
+
+      - name: Check out the existing implementation branch
+        run: |
+          set -euo pipefail
+
+          branch="poc/${TICKET_ID}"
+
+          if ! git fetch origin "$branch"; then
+            reason="Branch ${branch} does not exist on origin — this ticket reached \"ready for review\" without ever going through implement (or the branch was deleted since). Nothing to review."
+            echo "::error::${reason}"
+            echo "$reason" > "${RUNNER_TEMP}/failure-reason.txt"
+            exit 1
+          fi
+
+          git checkout -B "$branch" "origin/$branch"
+
+      - name: Resolve the OpenSpec change
+        run: |
+          set -euo pipefail
+
+          change_dir=$(find openspec/changes -mindepth 1 -maxdepth 1 -type d ! -name archive 2>/dev/null || true)
+          count=$(echo "$change_dir" | grep -c . || true)
+
+          if [ "$count" -ne 1 ]; then
+            reason="Expected exactly one active OpenSpec change on poc/${TICKET_ID}, found ${count}:
+          ${change_dir}"
+            echo "::error::${reason}"
+            echo "$reason" > "${RUNNER_TEMP}/failure-reason.txt"
+            exit 1
+          fi
+
+          change_name=$(basename "$change_dir")
+          echo "Resolved OpenSpec change: ${change_name}"
+          echo "$change_name" > .change-name
+          echo ".change-name" >> .git/info/exclude
+
+      - name: Write the ticket to ticket.md
+        env:
+          CLICKUP_API_TOKEN: ${{ secrets.CLICKUP_API_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          task_json="${RUNNER_TEMP}/task.json"
+
+          http_code=$(curl -sS -o "$task_json" -w '%{http_code}' \
+            -H "Authorization: ${CLICKUP_API_TOKEN}" \
+            "https://api.clickup.com/api/v2/task/${TICKET_ID}" || true)
+
+          if [ "$http_code" -lt 200 ] || [ "$http_code" -ge 300 ]; then
+            echo "::error::ClickUp GET task returned HTTP ${http_code}"
+            cat "$task_json"
+            {
+              echo "ClickUp GET task returned HTTP ${http_code}."
+              echo
+              cat "$task_json"
+            } > "${RUNNER_TEMP}/failure-reason.txt"
+            exit 1
+          fi
+
+          jq -r '.description // ""' "$task_json" > ticket.md
+          echo "ticket.md" >> .git/info/exclude
+
+      - name: Trust the workspace for Claude Code
+        run: |
+          set -euo pipefail
+
+          # See agent-propose.yml's identical step for why this exact form is required.
+          real_path=$(pwd -P)
+          claude_config="${HOME}/.claude.json"
+
+          existing='{}'
+          if [ -f "$claude_config" ]; then
+            existing=$(cat "$claude_config")
+          fi
+
+          printf '%s' "$existing" \
+            | jq --arg path "$real_path" '.projects[$path].hasTrustDialogAccepted = true' \
+            > "$claude_config"
+
+      - name: Install the Claude Code CLI and the superpowers plugin
+        run: |
+          npm install -g @anthropic-ai/claude-code
+          claude plugin install superpowers@claude-plugins-official
+
+      - name: Run the review agent
+        id: agent
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          set -euo pipefail
+
+          prompt="$(cat "${RUNNER_TEMP}/review-prompt.md")"
+          output_file="${RUNNER_TEMP}/claude-output.txt"
+          model="${CLAUDE_MODEL:-claude-sonnet-5}"
+          echo "Using model: ${model}"
+
+          claude_exit=0
+          claude -p "$prompt" \
+            --model "$model" \
+            --allowed-tools "Read,Grep,Glob,Skill,Task,Bash(git diff:*),Bash(git log:*),Bash(git show:*)" \
+            > "$output_file" 2>&1 || claude_exit=$?
+
+          cat "$output_file"
+
+          if [ "$claude_exit" -ne 0 ]; then
+            echo "::error::claude exited with status ${claude_exit}"
+            {
+              echo "claude exited with status ${claude_exit}."
+              echo
+              tail -c 2000 "$output_file"
+            } > "${RUNNER_TEMP}/failure-reason.txt"
+            exit "$claude_exit"
+          fi
+
+          # `|| true`: grep exits 1 if RESULT: is missing, which would otherwise abort
+          # this line under the externally active `bash -e` before the check below ever
+          # runs — same class of bug already fixed elsewhere in this pipeline.
+          result=$(grep -m1 '^RESULT:' "$output_file" | sed 's/^RESULT: *//') || true
+
+          if [ "$result" != "reviewed" ]; then
+            echo "::error::claude's output has no RESULT: reviewed line"
+            {
+              echo "claude's output has no RESULT: reviewed line — cannot confirm the review completed."
+              echo
+              tail -c 2000 "$output_file"
+            } > "${RUNNER_TEMP}/failure-reason.txt"
+            exit 1
+          fi
+
+          # Review body = everything printed except the RESULT: line itself. `|| true`:
+          # grep -v exits 1 if every line matches (a degenerate all-RESULT: output),
+          # which would otherwise abort the script here under the externally active
+          # `bash -e` — same reasoning as the guard above.
+          grep -v '^RESULT:' "$output_file" > "${RUNNER_TEMP}/review-body.txt" || true
+
+      - name: Post the review to GitHub, then a short ClickUp pointer
+        env:
+          CLICKUP_API_TOKEN: ${{ secrets.CLICKUP_API_TOKEN }}
+          # DISPATCH_PAT, not GITHUB_TOKEN — same reasoning as every other gh pr call in
+          # this pipeline (see header comment: confirmed for gh pr create/gh pr ready on
+          # this fork; not independently reconfirmed for gh pr review, used regardless).
+          GH_TOKEN: ${{ secrets.DISPATCH_PAT }}
+        run: |
+          set -uo pipefail
+
+          run_step() {
+            local label="$1"
+            shift
+            local output code
+            output=$("$@" 2>&1) && code=0 || code=$?
+            if [ "$code" -ne 0 ]; then
+              echo "$output"
+              {
+                echo "${label} failed:"
+                echo
+                echo "$output"
+              } > "${RUNNER_TEMP}/failure-reason.txt"
+              exit "$code"
+            fi
+            echo "$output"
+          }
+
+          run_step "gh pr review" gh pr review "poc/${TICKET_ID}" \
+            --comment \
+            --body-file "${RUNNER_TEMP}/review-body.txt" \
+            -R "${{ github.repository }}"
+
+          # `|| true` + explicit check, not a bare assignment: gh pr view failing here
+          # would otherwise abort the script under the externally active `bash -e`
+          # before the empty-value check below ever ran.
+          pr_url=$(gh pr view "poc/${TICKET_ID}" -R "${{ github.repository }}" --json url --jq '.url' || true)
+
+          if [ -z "$pr_url" ]; then
+            echo "::error::gh pr view returned no URL for poc/${TICKET_ID}"
+            echo "gh pr view returned no URL for poc/${TICKET_ID} — the review was posted, but the ClickUp pointer comment could not include a PR link." > "${RUNNER_TEMP}/failure-reason.txt"
+            exit 1
+          fi
+
+          comment_text=$(printf 'AI review posted.\n\nPR: %s' "$pr_url")
+          comment_payload=$(jq -n --arg t "$comment_text" '{comment_text: $t, notify_all: false}')
+          http_code=$(curl -sS -o "${RUNNER_TEMP}/comment-response.json" -w '%{http_code}' \
+            -X POST \
+            -H "Authorization: ${CLICKUP_API_TOKEN}" \
+            -H "Content-Type: application/json" \
+            "https://api.clickup.com/api/v2/task/${TICKET_ID}/comment" \
+            -d "$comment_payload" || true)
+
+          if [ "$http_code" -lt 200 ] || [ "$http_code" -ge 300 ]; then
+            echo "::error::ClickUp POST comment returned HTTP ${http_code}"
+            cat "${RUNNER_TEMP}/comment-response.json"
+            {
+              echo "ClickUp POST comment (review posted pointer) returned HTTP ${http_code}."
+              echo
+              cat "${RUNNER_TEMP}/comment-response.json"
+            } > "${RUNNER_TEMP}/failure-reason.txt"
+            exit 1
+          fi
+
+          echo "Ticket ${TICKET_ID}: review posted to ${pr_url}."
+
+      - name: On failure after the lock, flag for a human
+        if: failure() && steps.lock.outcome == 'success'
+        continue-on-error: true
+        env:
+          CLICKUP_API_TOKEN: ${{ secrets.CLICKUP_API_TOKEN }}
+        run: |
+          run_url="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          reason_file="${RUNNER_TEMP}/failure-reason.txt"
+
+          if [ -f "$reason_file" ]; then
+            reason=$(head -c 2500 "$reason_file")
+          else
+            reason="(no specific reason was captured for this failure — check the run log)"
+          fi
+
+          curl -sS -o /dev/null -w 'tag: %{http_code}\n' \
+            -X POST \
+            -H "Authorization: ${CLICKUP_API_TOKEN}" \
+            "https://api.clickup.com/api/v2/task/${TICKET_ID}/tag/needs-human" || true
+
+          comment_text=$(printf 'Automated review failed.\n\n%s\n\nRun: %s' "$reason" "$run_url")
+
+          comment_payload=$(jq -n --arg t "$comment_text" '{comment_text: $t, notify_all: false}')
+          curl -sS -o /dev/null -w 'comment: %{http_code}\n' \
+            -X POST \
+            -H "Authorization: ${CLICKUP_API_TOKEN}" \
+            -H "Content-Type: application/json" \
+            "https://api.clickup.com/api/v2/task/${TICKET_ID}/comment" \
+            -d "$comment_payload" || true
