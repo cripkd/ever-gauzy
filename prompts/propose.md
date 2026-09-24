@@ -27,9 +27,22 @@ Ticket: `ticket.md` in the repo root.
   test can assert against a running app. "Improve validation" is not a
   requirement; "rejects a due date earlier than the invoice date, showing
   <message>" is.
-- **Task 1 in `tasks.md` is always: write the failing Playwright spec,
-  commit it alone, no production code.** Implementation tasks start at 2.
-  This is a hard rule — the pipeline's red-before-green gate depends on it.
+- **Task 1 in `tasks.md` is always: write the failing Playwright spec.**
+  Write it before any implementation task, so it describes the intended
+  behaviour rather than being reverse-engineered from code that already
+  satisfies it. Implementation tasks start at 2. Do not instruct committing
+  it separately or verifying it fails in isolation — the implement stage
+  does every task in one combined push, not two, so there is no isolated
+  red run to describe.
+- **`tasks.md` only lists things a human or the implement agent actually
+  does** — writing code, a test, a config change, a `data-testid`. Never a
+  task whose entire content is "run X and confirm it passes" (lint,
+  typecheck, build, the test suite, re-running the spec from task 1). The
+  pipeline already runs all of that unconditionally on every push,
+  regardless of what `tasks.md` says — nothing in this pipeline reads
+  `tasks.md` to decide whether to run those checks, and nothing is wired
+  to check such a box off, so it can never legitimately close and doesn't
+  belong there.
 - If the ticket is too underspecified to write a testable requirement,
   do not guess. Write the proposal stating what is missing and stop.
 
