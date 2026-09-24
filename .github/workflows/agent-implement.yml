@@ -384,6 +384,16 @@ jobs:
           jq -r '.description // ""' "$task_json" > ticket.md
           echo "ticket.md" >> .git/info/exclude
 
+          # For the run-record emit step's TICKET_TITLE — same task.json already
+          # fetched above, no new API call. Heredoc form, same as
+          # agent-propose.yml's identical capture: a title can contain
+          # characters $GITHUB_ENV's plain KEY=value form can't handle safely.
+          {
+            echo "TICKET_TITLE<<TICKET_TITLE_EOF"
+            jq -r '.name // ""' "$task_json"
+            echo "TICKET_TITLE_EOF"
+          } >> "$GITHUB_ENV"
+
       - name: Trust the workspace for Claude Code
         run: |
           set -euo pipefail
@@ -997,6 +1007,7 @@ jobs:
           WORKFLOW="agent-implement" \
           EVENT_TYPE="${{ github.event.action || 'workflow_dispatch' }}" \
           TICKET_ID="${TICKET_ID}" \
+          TICKET_TITLE="${TICKET_TITLE:-}" \
           SPEC_ID="${SPEC_ID:-}" \
           MODE="${MODE}" \
           CAUSED_BY_RUN_ID="${CAUSED_BY_RUN_ID:-}" \

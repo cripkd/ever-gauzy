@@ -86,6 +86,16 @@ jobs:
             exit 1
           fi
 
+          # For the run-record emit step's TICKET_TITLE — same task.json already
+          # fetched above, no new API call. Heredoc form, same as
+          # agent-propose.yml's identical capture: a title can contain
+          # characters $GITHUB_ENV's plain KEY=value form can't handle safely.
+          {
+            echo "TICKET_TITLE<<TICKET_TITLE_EOF"
+            jq -r '.name // ""' task.json
+            echo "TICKET_TITLE_EOF"
+          } >> "$GITHUB_ENV"
+
       - name: 'Guard: skip if already processed'
         id: guard
         run: |
@@ -366,6 +376,7 @@ jobs:
           WORKFLOW="agent-intake" \
           EVENT_TYPE="${{ github.event.action || 'workflow_dispatch' }}" \
           TICKET_ID="${TICKET_ID}" \
+          TICKET_TITLE="${TICKET_TITLE:-}" \
           CAUSED_BY_RUN_ID="${CAUSED_BY_RUN_ID:-}" \
           TRIGGERED_BY="${TRIGGERED_BY:-manual}" \
           STARTED_AT="${STARTED_AT:-}" \

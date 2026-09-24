@@ -61,6 +61,7 @@ const record = {
 	workflow: required('WORKFLOW'),
 	event_type: required('EVENT_TYPE'),
 	ticket_id: required('TICKET_ID'),
+	ticket_title: str('TICKET_TITLE'),
 	spec_id: str('SPEC_ID'),
 	mode: str('MODE'),
 	caused_by_run_id: str('CAUSED_BY_RUN_ID'),

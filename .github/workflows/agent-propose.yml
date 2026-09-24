@@ -656,6 +656,7 @@ jobs:
           WORKFLOW="agent-propose" \
           EVENT_TYPE="${{ github.event.action || 'workflow_dispatch' }}" \
           TICKET_ID="${TICKET_ID}" \
+          TICKET_TITLE="${TICKET_TITLE:-}" \
           SPEC_ID="${SPEC_ID:-}" \
           CAUSED_BY_RUN_ID="${CAUSED_BY_RUN_ID:-}" \
           TRIGGERED_BY="${TRIGGERED_BY:-manual}" \
