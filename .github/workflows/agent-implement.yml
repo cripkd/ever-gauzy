@@ -589,23 +589,42 @@ jobs:
           # file in packages/core (46 dependent projects) plus one in packages/ui-core (30
           # more) made `nx affected --target=lint,typecheck,build` try to lint and build 74
           # projects in a single pass, which OOM'd outright on a standard GitHub-hosted
-          # runner — and even without crashing, it surfaced 141 pre-existing lint errors in
-          # files this ticket never touched (e.g. desktop-ui-lib components) as though they
-          # were this change's fault. Regression-catching across the dependent graph
-          # already has a home: pipeline-reference.md's stage 5, the accumulated e2e suite
-          # ("no separate regression gate — the accumulated suite IS the regression run").
-          # This self-check only needs to confirm what was actually written is clean, not
+          # runner. Regression-catching across the dependent graph already has a home:
+          # pipeline-reference.md's stage 5, the accumulated e2e suite ("no separate
+          # regression gate — the accumulated suite IS the regression run"). This
+          # self-check only needs to confirm what was actually written is clean, not
           # re-derive the whole dependent graph a second time.
           #
+          # `build`/`typecheck` stay scoped to the whole owning project (below,
+          # unchanged) — narrowing either to individual files would risk hiding a real
+          # regression in some OTHER file of the same project that imports what changed
+          # and now no longer type-checks against it. `lint`, by contrast, is real trouble
+          # at project scope: `nx lint <project>` lints the entire project regardless of
+          # what changed, so any change touching a large, pre-existing project (core,
+          # ui-core) surfaces that project's whole backlog of pre-existing lint debt as if
+          # it were this change's fault — confirmed on a real run: a change that touched
+          # nothing but task-create.handler.ts and one new spec file (both themselves
+          # lint-clean) still failed self-check on `core`/`ui-core` lint, entirely on
+          # pre-existing errors in files like seed-ever.ts this ticket never touched.
+          # Lint, unlike build/typecheck, is file-local static analysis with no cross-file
+          # implications, so it's safe to scope down: each project's `lint` target is
+          # invoked separately below with `--lintFilePatterns` set to only that project's
+          # own changed files (verified locally against a real project — `nx run
+          # core:lint --lintFilePatterns=<file>` lints exactly that file, not the whole
+          # project, still catches a real error when pointed at a file that has one, and
+          # accepts multiple `--lintFilePatterns` flags for more than one file).
+          #
           # Project resolution: walk up from each changed file to the nearest project.json
-          # ancestor. A file with none (e.g. anything under openspec/, which resolves only
-          # as far as the workspace root's own "ever-gauzy" pseudo-project) is harmless to
-          # include — that project defines no lint/typecheck/build target, and nx run-many
-          # silently no-ops a project missing a given target rather than failing (verified
-          # locally), same as it already does for the "no project defines typecheck yet"
+          # ancestor, recording "<project>\t<file>" pairs (not just project names) so the
+          # per-project lint pass below knows exactly which files belong to which project.
+          # A file with no owning project (e.g. anything under openspec/, which resolves
+          # only as far as the workspace root's own "ever-gauzy" pseudo-project) is
+          # harmless to include — that project defines no lint/typecheck/build target, and
+          # nx silently no-ops a target nothing declares (verified locally) rather than
+          # failing, same as it already does for the "no project defines typecheck yet"
           # case below.
           base_sha=$(git merge-base "origin/${{ github.event.repository.default_branch }}" HEAD)
-          projects=""
+          pairs=""
           while IFS= read -r file; do
             [ -z "$file" ] && continue
             dir=$(dirname "$file")
@@ -614,40 +633,97 @@ jobs:
             done
             if [ -f "$dir/project.json" ]; then
               name=$(jq -r '.name' "$dir/project.json")
-              projects="${projects}${name}"$'\n'
+              pairs="${pairs}${name}"$'\t'"${file}"$'\n'
             fi
           done < <(git diff --name-only "$base_sha" HEAD)
-          # `|| true`: grep -v exits 1 if every line is blank (the no-owning-project
-          # edge case, checked explicitly below) — a bare assignment here would otherwise
-          # abort the script under the externally active `bash -e` before that check ran.
-          projects=$(printf '%s' "$projects" | sort -u | grep -v '^$' | paste -sd, - || true)
+
+          # `|| true`: grep -v exits 1 if every line is blank (the no-owning-project edge
+          # case, checked explicitly below) — a bare assignment here would otherwise abort
+          # the script under the externally active `bash -e` before that check ran.
+          projects=$(printf '%s' "$pairs" | cut -f1 | sort -u | grep -v '^$' || true)
 
           echo "Self-check scoped to: ${projects:-(no owning project found for any changed file — nothing to check)}"
 
           if [ -z "$projects" ]; then
             echo "passed=true" >> "$GITHUB_OUTPUT"
           else
-            # typecheck: no project in this workspace defines that target today, but nx
-            # silently no-ops a target nothing declares (verified locally) rather than
-            # failing — harmless to ask for now, and picks it up automatically the day a
-            # project does define it.
+            # typecheck/build: no project in this workspace defines a typecheck target
+            # today, but nx silently no-ops a target nothing declares (verified locally)
+            # rather than failing — harmless to ask for now, and picks it up
+            # automatically the day a project does define it.
             #
             # `|| selfcheck_exit=$?`, not a bare assignment: GitHub Actions runs steps as
             # `bash -e {0}` regardless of this script's own `set` line (see
             # agent-propose.yml's extensive comments on this exact class of bug) — a bare
             # `selfcheck_exit=$?` on the line after a failing command never gets reached,
             # because the command itself already aborted the step under the externally
-            # active -e.
+            # active -e. Same reasoning applies to every nx invocation below.
             selfcheck_exit=0
-            npx nx run-many --target=lint,typecheck,build --projects="$projects" \
+            projects_csv=$(printf '%s' "$projects" | paste -sd, -)
+            npx nx run-many --target=typecheck,build --projects="$projects_csv" \
               > "$output_file" 2>&1 || selfcheck_exit=$?
+
+            # lint, one project at a time, scoped to only that project's own changed
+            # files that still exist at HEAD — a deleted file can't be passed to
+            # --lintFilePatterns (ESLint has nothing to read; errorOnUnmatchedPattern
+            # defaults to true, which would fail the run on a false, unrelated error). A
+            # project whose only changed file(s) were deletions has nothing left to lint;
+            # skipped entirely rather than falling back to no --lintFilePatterns at all,
+            # which would silently re-expand to the whole project (its schema default is
+            # {projectRoot}) — exactly the failure mode this change exists to avoid.
+            #
+            # Also skips any project that defines no `lint` target at all — unlike
+            # `nx run-many`, which silently no-ops a project missing a given target,
+            # `nx run <project>:lint` on such a project hard-errors ("Cannot find
+            # configuration for task"), confirmed on a real run against this exact
+            # workspace: the root `ever-gauzy` pseudo-project (only defines
+            # local-registry) and `poc-e2e` (only defines e2e) both blew up this way the
+            # first time this was tried, unrelated to any real lint problem.
+            #
+            # Collected into an array first, then iterated with `for` — NOT a
+            # `while read ... done < <(...)` loop directly. Confirmed by reproducing it
+            # locally: running `npx nx show project` inside a `while read` loop fed by
+            # process substitution silently truncates the loop after a couple of
+            # iterations (an stdin-contention artifact between the loop's own read and
+            # whatever npx/nx does with fd 0) — the last project(s) in the list were
+            # silently never linted at all, no error, nothing in the log to notice. A
+            # `for` loop over a pre-built array never touches stdin, so it can't have
+            # this problem.
+            project_array=()
+            while IFS= read -r line; do
+              [ -z "$line" ] && continue
+              project_array+=("$line")
+            done <<< "$projects"
+
+            for project in "${project_array[@]}"; do
+              if ! npx nx show project "$project" --json 2>/dev/null \
+                    | jq -e 'has("targets") and (.targets | has("lint"))' > /dev/null; then
+                echo "Skipping ${project}:lint — this project defines no lint target." >> "$output_file"
+                continue
+              fi
+
+              file_args=()
+              while IFS= read -r file; do
+                [ -z "$file" ] && continue
+                [ -f "$file" ] || continue
+                file_args+=("--lintFilePatterns=${file}")
+              done < <(printf '%s' "$pairs" | awk -F'\t' -v p="$project" '$1 == p {print $2}')
+
+              if [ "${#file_args[@]}" -eq 0 ]; then
+                echo "Skipping ${project}:lint — its only changed file(s) were deletions." >> "$output_file"
+                continue
+              fi
+
+              npx nx run "${project}:lint" "${file_args[@]}" \
+                >> "$output_file" 2>&1 || selfcheck_exit=$?
+            done
 
             cat "$output_file"
 
             if [ "$selfcheck_exit" -ne 0 ]; then
               echo "passed=false" >> "$GITHUB_OUTPUT"
               {
-                echo "nx run-many --target=lint,typecheck,build --projects=${projects} failed:"
+                echo "Self-check failed (typecheck/build for ${projects_csv}, or lint for one of its projects, scoped to changed files):"
                 echo
                 tail -c 3000 "$output_file"
               } > "${RUNNER_TEMP}/failure-reason.txt"
