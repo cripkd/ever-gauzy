@@ -51,13 +51,20 @@ export class TaskCreateHandler implements ICommandHandler<TaskCreateCommand> {
 		try {
 			// Destructure input and triggered event flag from the command
 			const { input, triggeredEvent } = command;
-			const { organizationId, mentionEmployeeIds = [], members = [], ...data } = input;
+			const { organizationId, mentionEmployeeIds = [], members: inputMembers = [], ...data } = input;
 
 			// Retrieve current tenant ID from request context or use input tenant ID
 			const tenantId = RequestContext.currentTenantId() ?? data.tenantId;
 
 			// Retrieve current user from the request context
 			const user = RequestContext.currentUser();
+
+			// `currentEmployeeId()` only resolves for a user without CHANGE_SELECTED_EMPLOYEE
+			// permission (i.e. an Employee-role creator, not an Admin/Manager). When such a
+			// creator picked no members explicitly, fall back to assigning them to their own task.
+			const creatorEmployeeId = RequestContext.currentEmployeeId();
+			const members =
+				inputMembers.length > 0 || !creatorEmployeeId ? inputMembers : [{ id: creatorEmployeeId } as IEmployee];
 
 			// Determine the project based on the provided data
 			const project = data.projectId
