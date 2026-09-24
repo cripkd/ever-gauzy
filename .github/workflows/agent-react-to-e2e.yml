@@ -1,0 +1,346 @@
+name: Agent React to E2E
+
+# Fires once per completed poc-e2e.yml run and closes the loop that was missing before
+# this workflow existed: agent-implement.yml used to mark a PR ready for review as soon
+# as its own self-check (lint/typecheck/build) passed — before the real e2e suite, which
+# runs separately and asynchronously on the push, had even finished. Confirmed live on
+# ticket 869f5qg9d: a WIP push there triggered poc-e2e.yml automatically and came back
+# red, and nothing downstream ever noticed.
+#
+# poc-e2e.yml itself stays completely ticket-agnostic — it has no idea what triggered it
+# or why. This workflow is the bridge: workflow_run fires regardless of which branch
+# triggered the target workflow, and every ticket branch is deterministically
+# poc/<ticket_id>, so the correlation is a plain string match on the branch name, nothing
+# poc-e2e.yml needs to know about.
+#
+# Flow:
+#   1. Job-level `if:` — branch must look like poc/<ticket_id>, or skip the whole job.
+#      Not every PR in this repo is a ticket branch (e.g. one opened directly against
+#      develop).
+#   2. Three guards, all in one step, each exiting quietly (not as a failure) rather than
+#      acting on an e2e run this workflow has no business touching:
+#        - Status must be "in progress". Confirmed necessary, not defensive-coding
+#          paranoia: propose's own PR push (openspec markdown only, zero code) produced a
+#          GREEN poc-e2e run on this same ticket while it was still at "spec proposed" —
+#          without this guard, every propose-stage PR would get wrongly advanced straight
+#          to "ready for review", undrafted, skipping the entire implement stage.
+#        - "for-ai" must be tagged — same opt-in every poller in this pipeline already
+#          requires, checked fresh here too, so a human who pulled a ticket out of
+#          automation doesn't have their manual push advance the ticket out from under
+#          them.
+#        - head_sha must still be the branch tip — a stale result (superseded by a newer
+#          push already) gets skipped rather than acted on.
+#   3. success -> PUT status "ready for review", `gh pr ready` (moved here from
+#      agent-implement.yml, which now stops one step short of this — gated on a REAL
+#      green e2e result, not just a locally-clean self-check), short ClickUp comment.
+#      Verified this can't loop: poc-e2e.yml's bare `on: pull_request:` defaults to
+#      [opened, synchronize, reopened] — ready_for_review isn't in that list, and
+#      `gh pr ready` pushes no commit, so undrafting can never re-trigger the suite that
+#      caused the undraft. (Anyone later adding `ready_for_review` to that trigger list
+#      would silently create an infinite green loop — don't.)
+#   4. failure -> checkout + check out the ticket branch, count prior retry-fix commits
+#      (a distinct, greppable "Fix e2e failure: <ticket_id>" prefix agent-implement.yml
+#      writes, never conflated with its "WIP: ... blocked"/"WIP: ... self-check failed"
+#      commits). At MAX_E2E_RETRIES, tag needs-human + comment, leave status at
+#      "in progress" (never left it), stop retrying. Below the cap: download the
+#      e2e-results-json artifact poc-e2e.yml uploads on failure, classify per
+#      pipeline-reference.md's own existing split (new spec itself red -> "did not do the
+#      task"; new spec green, something else red -> "collateral breakage"), and
+#      re-dispatch clickup-implement with the classified, truncated failure text attached
+#      — reusing agent-implement.yml itself, not a separate agent, since fixing a red e2e
+#      test is still "implement against the approved spec," just with real evidence this
+#      time instead of a blind first guess.
+#   5. Anything else (cancelled, skipped, timed_out): no-op. A human-initiated cancel
+#      isn't evidence the code is broken.
+#
+# Deliberately NOT covered: a failing test with no evident connection to this ticket's
+# own changes (a pre-existing flake). Flaky-test triage is its own discipline; today such
+# a failure just reads as "collateral breakage" and gets retried like any other. A known,
+# accepted gap, not one fixed silently later without anyone noticing it was ever there.
+
+on:
+  workflow_run:
+    workflows: ['POC E2E']
+    types: [completed]
+
+# Only ever act on runs against a ticket branch. Everything else (e.g. a PR opened
+# straight against develop) is none of this workflow's business.
+jobs:
+  react:
+    if: startsWith(github.event.workflow_run.head_branch, 'poc/')
+    name: React to e2e result
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    concurrency:
+      # Two e2e completions close together (e.g. a stale run finishing just after a
+      # fresher one) would otherwise race two instances of this job against the same
+      # ticket and could double-dispatch a retry.
+      group: agent-react-to-e2e-${{ github.event.workflow_run.head_branch }}
+      cancel-in-progress: false
+    permissions:
+      # Read-only: this job never pushes (contents: read, via the default, is enough for
+      # checkout), and gh pr ready goes through DISPATCH_PAT below, not this token — same
+      # reasoning agent-implement.yml's own PR-operation steps already use.
+      contents: read
+      actions: read
+    env:
+      TICKET_ID: ${{ github.event.workflow_run.head_branch }}
+      # Each cycle costs a full CI bring-up plus a real Claude invocation — genuinely
+      # non-trivial. Three gives room for "try, learn from a real failure, try again,
+      # learn again, try a third informed time," the same number of honest attempts a
+      # human typically makes before asking for help, while bounding spend on a change
+      # that's fundamentally stuck.
+      MAX_E2E_RETRIES: 3
+    steps:
+      - name: Strip the poc/ prefix
+        run: echo "TICKET_ID=${TICKET_ID#poc/}" >> "$GITHUB_ENV"
+
+      - name: Guards — in progress, tagged for-ai, not stale
+        id: guard
+        env:
+          CLICKUP_API_TOKEN: ${{ secrets.CLICKUP_API_TOKEN }}
+          GH_TOKEN: ${{ secrets.DISPATCH_PAT }}
+          RUN_HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          set -euo pipefail
+
+          task_json="${RUNNER_TEMP}/task.json"
+          http_code=$(curl -sS -o "$task_json" -w '%{http_code}' \
+            -H "Authorization: ${CLICKUP_API_TOKEN}" \
+            "https://api.clickup.com/api/v2/task/${TICKET_ID}" || true)
+
+          if [ "$http_code" -lt 200 ] || [ "$http_code" -ge 300 ]; then
+            echo "::warning::ClickUp GET task returned HTTP ${http_code} — skipping quietly."
+            echo "proceed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          status=$(jq -r '.status' "$task_json")
+          has_for_ai=$(jq -r '([.tags[]?.name] | index("for-ai")) != null' "$task_json")
+
+          if [ "$status" != "in progress" ]; then
+            echo "Ticket ${TICKET_ID} is at \"${status}\", not \"in progress\" (e.g. a propose-stage PR push, not an implement one) — skipping quietly."
+            echo "proceed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if [ "$has_for_ai" != "true" ]; then
+            echo "Ticket ${TICKET_ID} is not tagged for-ai — a human owns this ticket right now, not automation. Skipping quietly."
+            echo "proceed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          current_sha=$(gh api "/repos/${{ github.repository }}/git/refs/heads/poc/${TICKET_ID}" --jq '.object.sha')
+          if [ "$current_sha" != "$RUN_HEAD_SHA" ]; then
+            echo "This run's commit (${RUN_HEAD_SHA}) is no longer poc/${TICKET_ID}'s tip (${current_sha}) — superseded by a newer push already. Skipping quietly."
+            echo "proceed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "proceed=true" >> "$GITHUB_OUTPUT"
+
+      - name: On green — mark ready for review
+        if: steps.guard.outputs.proceed == 'true' && github.event.workflow_run.conclusion == 'success'
+        env:
+          CLICKUP_API_TOKEN: ${{ secrets.CLICKUP_API_TOKEN }}
+          # DISPATCH_PAT, not GITHUB_TOKEN — same reasoning as every other gh pr call in
+          # this pipeline: this fork blocks GITHUB_TOKEN from PR operations regardless of
+          # default_workflow_permissions, confirmed on a real run.
+          GH_TOKEN: ${{ secrets.DISPATCH_PAT }}
+        run: |
+          set -euo pipefail
+
+          status_payload=$(jq -n '{status: "ready for review"}')
+          http_code=$(curl -sS -o "${RUNNER_TEMP}/status-response.json" -w '%{http_code}' \
+            -X PUT \
+            -H "Authorization: ${CLICKUP_API_TOKEN}" \
+            -H "Content-Type: application/json" \
+            "https://api.clickup.com/api/v2/task/${TICKET_ID}" \
+            -d "$status_payload" || true)
+
+          if [ "$http_code" -lt 200 ] || [ "$http_code" -ge 300 ]; then
+            echo "::error::ClickUp PUT status (ready for review) returned HTTP ${http_code}"
+            cat "${RUNNER_TEMP}/status-response.json"
+            exit 1
+          fi
+
+          gh pr ready "poc/${TICKET_ID}" -R "${{ github.repository }}"
+
+          run_url="${{ github.event.workflow_run.html_url }}"
+          comment_text=$(printf 'e2e passed — PR marked ready for review.\n\nRun: %s' "$run_url")
+          comment_payload=$(jq -n --arg t "$comment_text" '{comment_text: $t, notify_all: false}')
+          curl -sS -o /dev/null -w 'comment: %{http_code}\n' \
+            -X POST \
+            -H "Authorization: ${CLICKUP_API_TOKEN}" \
+            -H "Content-Type: application/json" \
+            "https://api.clickup.com/api/v2/task/${TICKET_ID}/comment" \
+            -d "$comment_payload" || true
+
+          echo "Ticket ${TICKET_ID}: e2e green — moved to \"ready for review\", PR undrafted."
+
+      - name: Check out the ticket branch (failure path only)
+        if: steps.guard.outputs.proceed == 'true' && github.event.workflow_run.conclusion == 'failure'
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Switch to the ticket branch
+        if: steps.guard.outputs.proceed == 'true' && github.event.workflow_run.conclusion == 'failure'
+        run: |
+          set -euo pipefail
+          git fetch origin "poc/${TICKET_ID}"
+          git checkout -B "poc/${TICKET_ID}" "origin/poc/${TICKET_ID}"
+
+      - name: On red — count retries, then cap or dispatch a fix
+        if: steps.guard.outputs.proceed == 'true' && github.event.workflow_run.conclusion == 'failure'
+        env:
+          CLICKUP_API_TOKEN: ${{ secrets.CLICKUP_API_TOKEN }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          DISPATCH_PAT: ${{ secrets.DISPATCH_PAT }}
+          RUN_URL: ${{ github.event.workflow_run.html_url }}
+          RUN_ID: ${{ github.event.workflow_run.id }}
+        run: |
+          set -euo pipefail
+
+          # `|| true`: grep -c exits 1 when the count is 0 — the expected case on a
+          # first-ever red run — which would otherwise abort this line under the
+          # externally active `bash -e` before the count is ever used.
+          count=$(git log --oneline | grep -c "Fix e2e failure: ${TICKET_ID}" || true)
+          echo "Prior e2e-fix retry attempts on poc/${TICKET_ID}: ${count}"
+
+          if [ "$count" -ge "$MAX_E2E_RETRIES" ]; then
+            curl -sS -o /dev/null -w 'tag: %{http_code}\n' \
+              -X POST \
+              -H "Authorization: ${CLICKUP_API_TOKEN}" \
+              "https://api.clickup.com/api/v2/task/${TICKET_ID}/tag/needs-human" || true
+
+            comment_text=$(printf 'e2e failed %s times — attempts exhausted, needs a human.\n\nRun: %s' "$count" "$RUN_URL")
+            comment_payload=$(jq -n --arg t "$comment_text" '{comment_text: $t, notify_all: false}')
+            curl -sS -o /dev/null -w 'comment: %{http_code}\n' \
+              -X POST \
+              -H "Authorization: ${CLICKUP_API_TOKEN}" \
+              -H "Content-Type: application/json" \
+              "https://api.clickup.com/api/v2/task/${TICKET_ID}/comment" \
+              -d "$comment_payload" || true
+
+            echo "Ticket ${TICKET_ID}: e2e retries exhausted (${count}/${MAX_E2E_RETRIES}) — tagged needs-human, status left at \"in progress\", not retrying."
+            exit 0
+          fi
+
+          # Which spec is THIS change's own new one (task 1's output)? Resolved the same
+          # informal way agent-react-to-e2e reads any openspec change — no CLI needed,
+          # there's exactly one non-archived change dir on this branch by the time it
+          # reaches "in progress" (agent-implement.yml already enforces that).
+          new_spec_basename=""
+          change_dir=$(find openspec/changes -mindepth 1 -maxdepth 1 -type d ! -name archive 2>/dev/null | head -n1 || true)
+          if [ -n "$change_dir" ] && [ -f "$change_dir/tasks.md" ]; then
+            # shellcheck disable=SC2016 # the backticks here are a literal regex match
+            # (markdown inline-code quoting a file path in tasks.md), not command
+            # substitution — must stay single-quoted.
+            new_spec_path=$(grep -oE '`[^`]+\.spec\.ts`' "$change_dir/tasks.md" | head -n1 | tr -d '`' || true)
+            if [ -n "$new_spec_path" ]; then
+              new_spec_basename=$(basename "$new_spec_path")
+            fi
+          fi
+
+          # Cross-workflow artifact download needs actions: read (granted above) — same
+          # repo, so the default GITHUB_TOKEN is enough; no PAT needed for a same-repo
+          # read.
+          mkdir -p "${RUNNER_TEMP}/e2e-results"
+          gh run download "$RUN_ID" \
+            --repo "${{ github.repository }}" \
+            --name e2e-results-json \
+            --dir "${RUNNER_TEMP}/e2e-results" \
+            || echo "::warning::Could not download e2e-results-json for run ${RUN_ID} — falling back to a generic failure note."
+
+          results_file="${RUNNER_TEMP}/e2e-results/results.json"
+
+          if [ -f "$results_file" ]; then
+            failures=$(jq '
+              def all_specs:
+                (.specs // []) + ((.suites // []) | map(all_specs) | add // []);
+              [.suites[]? | all_specs] | add // []
+              | map(select(.ok == false))
+              | map({file, title, error: (.tests[0].results[0].error.message // "no error message")})
+            ' "$results_file")
+          else
+            failures="[]"
+          fi
+
+          failure_count=$(echo "$failures" | jq 'length')
+
+          if [ "$failure_count" -eq 0 ]; then
+            ci_failure=$(printf 'poc-e2e.yml failed (run %s) but no specific failing test could be extracted from its results — check the run log directly.' "$RUN_URL")
+          else
+            new_spec_failing=$(echo "$failures" | jq --arg name "$new_spec_basename" '[.[] | select(.file == $name)] | length > 0')
+
+            if [ "$new_spec_failing" = "true" ] && [ -n "$new_spec_basename" ]; then
+              kind="Your own new spec is failing — the implementation doesn't satisfy it yet."
+              relevant=$(echo "$failures" | jq --arg name "$new_spec_basename" '[.[] | select(.file == $name)]')
+            else
+              kind="Your new spec passes, but this change broke a different, previously-passing test — a regression."
+              relevant="$failures"
+            fi
+
+            # shellcheck disable=SC2016 # \(...) here is jq's own string interpolation
+            # inside a single-quoted jq program, not a shell expansion — must stay
+            # single-quoted so bash doesn't try to expand it itself.
+            detail=$(echo "$relevant" | jq -r '.[] | "- \(.file) — \(.title)\n  \(.error)"' | sed -E 's/\x1b\[[0-9;]*m//g')
+            ci_failure=$(printf '%s\n\nRun: %s\n\n%s' "$kind" "$RUN_URL" "$detail")
+          fi
+
+          # Truncated to a bounded size — matches every other truncated comment already
+          # in this pipeline, and repository_dispatch client_payload isn't meant to carry
+          # unbounded text either.
+          ci_failure=$(printf '%s' "$ci_failure" | head -c 3000)
+
+          payload=$(jq -n \
+            --arg ticket_id "$TICKET_ID" \
+            --arg ci_failure "$ci_failure" \
+            --argjson attempt_number "$((count + 1))" \
+            '{event_type: "clickup-implement", client_payload: {ticket_id: $ticket_id, ci_failure: $ci_failure, attempt_number: $attempt_number}}')
+
+          http_code=$(curl -sS -o "${RUNNER_TEMP}/dispatch-response.json" -w '%{http_code}' \
+            -X POST \
+            -H "Authorization: Bearer ${DISPATCH_PAT}" \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "https://api.github.com/repos/${{ github.repository }}/dispatches" \
+            -d "$payload")
+
+          if [ "$http_code" -lt 200 ] || [ "$http_code" -ge 300 ]; then
+            echo "::error::GitHub dispatch API returned HTTP ${http_code} for ticket ${TICKET_ID} e2e-fix retry"
+            cat "${RUNNER_TEMP}/dispatch-response.json"
+            exit 1
+          fi
+
+          echo "Ticket ${TICKET_ID}: e2e red (attempt $((count + 1))/${MAX_E2E_RETRIES}) — dispatched a fix retry with real failure context."
+
+      - name: On failure after the guards passed, flag for a human
+        # Gated on the guards having passed, not on any single step's own outcome — this
+        # is the one step that always runs regardless of which branch (success/failure)
+        # actually executed, so it's the right place for a single catch-all. Same shape
+        # as agent-propose.yml's and agent-implement.yml's own generic catch-alls: an
+        # unexpected failure here (e.g. a transient ClickUp/GitHub API error) would
+        # otherwise fail silently, visible only to someone actively watching Actions run
+        # history, not on the ticket at all.
+        if: failure() && steps.guard.outputs.proceed == 'true'
+        continue-on-error: true
+        env:
+          CLICKUP_API_TOKEN: ${{ secrets.CLICKUP_API_TOKEN }}
+        run: |
+          run_url="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+
+          curl -sS -o /dev/null -w 'tag: %{http_code}\n' \
+            -X POST \
+            -H "Authorization: ${CLICKUP_API_TOKEN}" \
+            "https://api.clickup.com/api/v2/task/${TICKET_ID}/tag/needs-human" || true
+
+          comment_text=$(printf 'Automated e2e reaction failed unexpectedly (this is not the e2e suite itself failing — that case is handled separately).\n\nRun: %s' "$run_url")
+          comment_payload=$(jq -n --arg t "$comment_text" '{comment_text: $t, notify_all: false}')
+          curl -sS -o /dev/null -w 'comment: %{http_code}\n' \
+            -X POST \
+            -H "Authorization: ${CLICKUP_API_TOKEN}" \
+            -H "Content-Type: application/json" \
+            "https://api.clickup.com/api/v2/task/${TICKET_ID}/comment" \
+            -d "$comment_payload" || true

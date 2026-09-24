@@ -19,7 +19,19 @@ Change id: `.change-name` in the repo root. Ticket context (supplementary
    to implement.
 3. Read every file listed under `contextFiles` (proposal, spec delta,
    design if present, tasks) before writing any code.
-4. Work through every task in `tasks.md` top to bottom, including task 1
+4. Check for `.ci-failure.md` in the repo root. If it exists, this is a
+   retry: the workflow already pushed your prior attempt on this exact
+   change, the real Playwright suite ran against it for real, and this
+   file is that run's actual failure — either your new spec itself
+   failing, or a different, previously-passing spec broken by your
+   change (a regression). Read it before doing anything else. Fixing
+   this failure is now the primary objective — not restarting from
+   scratch, and not re-verifying tasks `tasks.md` already shows complete
+   unless the failure itself implicates one of them. Everything else
+   below still applies: still work from `tasks.md`, still mark tasks
+   `- [x]` only once genuinely done, still stop and report `blocked`
+   rather than guess if the fix isn't covered by the approved spec.
+5. Work through every task in `tasks.md` top to bottom, including task 1
    (the failing Playwright spec) — treat it like any other task, not a
    separate phase. For each task, first tell which kind it is:
 
@@ -44,7 +56,7 @@ Change id: `.change-name` in the repo root. Ticket context (supplementary
    confirm it) is a code task: do the change, and only the confirmation
    part is left to the workflow. Verification language never excuses
    skipping a described change.
-5. When every code task is checked off, stop. You are done — unchecked
+6. When every code task is checked off, stop. You are done — unchecked
    verification-only tasks are expected, not a problem.
 
 ## When to stop instead of continuing

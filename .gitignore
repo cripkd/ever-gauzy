@@ -167,3 +167,8 @@ apps/server-api/src/assets/icons/menu
 .claude/settings.local.json
 
 /test-results
+# Root-anchored /test-results above doesn't cover apps/poc-e2e/test-results (Playwright's
+# outputDir there is anchored to the config's own directory, not the workspace root —
+# see playwright.config.ts). playwright-report was never ignored at all until now.
+apps/poc-e2e/test-results
+apps/poc-e2e/playwright-report

@@ -190,3 +190,26 @@ jobs:
           exit $status
         env:
           CI: 'true'
+
+      # Both if: failure() — everyday green runs upload nothing. Split into two so the
+      # small JSON stays fast to fetch programmatically (agent-react-to-e2e.yml
+      # downloads exactly this one, cross-workflow, to build retry context) regardless
+      # of how large the human-facing HTML report (which embeds the relevant
+      # screenshots/traces per test) gets. Paths match playwright.config.ts's
+      # __dirname-anchored outputDir/reporter paths — verified locally that Playwright
+      # actually writes there under the same cwd the @nx/playwright executor uses.
+      - name: Upload e2e results (JSON)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-results-json
+          path: apps/poc-e2e/test-results/results.json
+          retention-days: 14
+
+      - name: Upload e2e report (HTML, screenshots, traces)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-report
+          path: apps/poc-e2e/playwright-report/
+          retention-days: 14

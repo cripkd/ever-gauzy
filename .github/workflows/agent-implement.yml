@@ -1,19 +1,25 @@
 name: Agent Implement
 
-# Fires once per clickup-implement dispatch from poll-clickup-implement.yml. Executes an
-# already-approved OpenSpec change's tasks.md against the real codebase, on the same
-# poc/<ticket_id> branch and draft PR agent-propose.yml created, and pushes the result so
-# that PR is ready for human review. See prompts/implement.md for Claude's exact contract.
+# Fires once per clickup-implement dispatch from either poll-clickup-implement.yml (a
+# fresh ticket, "ready for dev") or agent-react-to-e2e.yml (a retry, after a red e2e
+# result on a prior push from this same workflow). Executes an already-approved OpenSpec
+# change's tasks.md against the real codebase, on the same poc/<ticket_id> branch and
+# draft PR agent-propose.yml created, and pushes the result. See prompts/implement.md for
+# Claude's exact contract.
 #
 # Flow:
 #   1. PUT status -> in progress. FIRST action, before checkout. Dispatch lock, same
 #      reasoning as agent-propose.yml: poll-clickup-implement.yml only ever queries
 #      statuses[]=ready%20for%20dev, so a ticket moved out of that status can't be
-#      re-dispatched by a later poll cycle.
+#      re-dispatched by a later poll cycle. On a retry dispatch the ticket is already at
+#      "in progress" — this PUT is then just a harmless, idempotent re-confirmation.
 #   2. Full checkout (fetch-depth: 0), then fetch + check out the EXISTING poc/<ticket_id>
 #      branch (unlike propose, this workflow never creates a branch — a ticket can't reach
 #      "ready for dev" without having gone through propose first, so the branch and its
-#      draft PR must already exist; if the fetch fails, that's a real error).
+#      draft PR must already exist; if the fetch fails, that's a real error). If this
+#      dispatch carries ci_failure (a retry), write it to .ci-failure.md here — the actual
+#      failure from the last real poc-e2e.yml run against this ticket's prior attempt, for
+#      the prompt to read and fix against, instead of guessing blind.
 #   3. Install Claude Code and the openspec CLI, then restore node_modules — this workflow
 #      DOES touch application code, unlike propose, so (unlike propose) it needs the full
 #      dependency tree. Reuses poc-e2e.yml's own restore/archive scripts and exact cache
@@ -26,11 +32,12 @@ name: Agent Implement
 #      propose — supplementary context; the OpenSpec artifacts are authoritative.
 #   6. claude -p, model pinned via CLAUDE_MODEL, --allowed-tools
 #      "Read,Write,Edit,Glob,Grep,Bash(openspec:*)" — same scope as propose. Claude
-#      implements every task in tasks.md and marks it complete; it does not commit, push,
-#      run tests, touch the PR, or run openspec archive — the workflow does all of that.
-#      Notably absent from --allowed-tools: Plan Mode. There's no human here to approve a
-#      plan, and the plan already exists (tasks.md itself, an already-approved artifact)
-#      — Claude's job is to execute it, not draft a new one.
+#      implements every task in tasks.md and marks it complete (or fixes the
+#      .ci-failure.md failure on a retry); it does not commit, push, run tests, touch the
+#      PR, or run openspec archive — the workflow does all of that. Notably absent from
+#      --allowed-tools: Plan Mode. There's no human here to approve a plan, and the plan
+#      already exists (tasks.md itself, an already-approved artifact) — Claude's job is to
+#      execute it, not draft a new one.
 #   7. RESULT: blocked -> same shape as agent-propose.yml's insufficient-detail path: push
 #      whatever real progress exists (for inspection), revert status back to "ready for
 #      dev", tag "needs-human" AND "implement-blocked", comment with the reason. This is a
@@ -45,7 +52,9 @@ name: Agent Implement
 #      RESULT: implemented -> self-check (nx affected lint/typecheck/build) before pushing;
 #      a self-check failure IS treated as a real failure (tag "needs-human", generic
 #      catch-all below) — unlike "blocked", the agent believed it was done and wasn't.
-#      Only a clean self-check leads to commit + push + `gh pr ready` (undraft).
+#      A clean self-check leads to commit + push — NOT `gh pr ready`. The PR stays in
+#      draft: agent-react-to-e2e.yml is what undrafts it, gated on poc-e2e.yml actually
+#      coming back green for this exact commit, not just a locally-clean self-check.
 #   8. Any failure from step 2 onward: tag "needs human" + comment with the run URL, same
 #      generic catch-all as agent-propose.yml.
 
@@ -63,11 +72,20 @@ concurrency:
   cancel-in-progress: false
 
 permissions:
+  # No pull-requests: write — this job no longer performs any PR operation itself
+  # (gh pr ready moved to agent-react-to-e2e.yml, gated on a real green e2e result).
   contents: write
-  pull-requests: write
 
 env:
   TICKET_ID: ${{ github.event.client_payload.ticket_id || inputs.ticket_id }}
+  # Both optional — only set when agent-react-to-e2e.yml re-dispatches this same event
+  # type after a red e2e result. Job-level (not step-local), same as TICKET_ID, so every
+  # step that needs them references $CI_FAILURE/$ATTEMPT_NUMBER rather than any step
+  # splicing the raw ${{ }} expression into its own script body — CI_FAILURE is parsed
+  # CI output (test names, error messages), external content no different in kind from
+  # TICKET_ID itself, so it gets the same treatment.
+  CI_FAILURE: ${{ github.event.client_payload.ci_failure }}
+  ATTEMPT_NUMBER: ${{ github.event.client_payload.attempt_number }}
   # Same repo variable agent-propose.yml and agent-intake.yml already pin this to — an
   # unpinned run defaults to a different model entirely (see agent-propose.yml's own
   # comment on this), which is exactly what this pipeline pins everything against.
@@ -146,6 +164,19 @@ jobs:
           fi
 
           git checkout -B "$branch" "origin/$branch"
+
+      - name: Write CI failure context, if this is a retry
+        if: env.CI_FAILURE != ''
+        run: |
+          set -euo pipefail
+
+          printf '%s\n' "$CI_FAILURE" > .ci-failure.md
+
+          # Locally ignored, not via the tracked .gitignore — same reasoning as
+          # ticket.md/.change-name: this is per-run derived state, never committed.
+          echo ".ci-failure.md" >> .git/info/exclude
+
+          echo "Wrote .ci-failure.md (attempt ${ATTEMPT_NUMBER})"
 
       - name: Setup Node
         uses: actions/setup-node@v4
@@ -327,9 +358,9 @@ jobs:
           # ticket/spec content CLAUDE.md already treats as untrusted input), and GitHub
           # splices a `${{ }}` expression into the script's literal text before bash ever
           # sees it — an unescaped `"` or `$(...)` on the TASKS: line would become
-          # executable shell in a job holding contents: write, pull-requests: write, and
-          # three API tokens. env: values don't have this problem; they're passed as
-          # actual process environment, not spliced into source text.
+          # executable shell in a job holding contents: write and three API tokens.
+          # env: values don't have this problem; they're passed as actual process
+          # environment, not spliced into source text.
           TASKS: ${{ steps.agent.outputs.tasks }}
         run: |
           set -uo pipefail
@@ -469,18 +500,20 @@ jobs:
 
           exit 1
 
-      - name: Commit, push, and mark the PR ready for review
+      - name: Commit and push
         if: steps.agent.outputs.result == 'implemented' && steps.selfcheck.outputs.passed == 'true'
-        # Deliberately does not clear a leftover "implement-blocked" tag from an earlier
-        # blocked run on this same ticket, even on a now-clean success: that tag's removal
-        # is the human's own unblock signal (see poll-clickup-implement.yml's header
-        # comment), not something this workflow infers from a later run merely completing.
-        env:
-          # DISPATCH_PAT, not GITHUB_TOKEN — same reasoning as agent-propose.yml's `gh pr
-          # create` step: this fork blocks GITHUB_TOKEN from PR operations regardless of
-          # default_workflow_permissions, confirmed there on a real run. `gh pr ready`
-          # is a PR operation too, so it needs the same real token.
-          GH_TOKEN: ${{ secrets.DISPATCH_PAT }}
+        # Does NOT mark the PR ready for review — that used to happen right here, on
+        # nothing more than this self-check (lint/typecheck/build) passing, before the
+        # real e2e suite had even run. It's now agent-react-to-e2e.yml's job, gated on
+        # poc-e2e.yml actually coming back green for this exact commit: the PR stays in
+        # draft until there's real evidence behind "ready for review", not just a
+        # locally-clean build.
+        #
+        # Also deliberately does not clear a leftover "implement-blocked" tag from an
+        # earlier blocked run on this same ticket, even on a now-clean success: that
+        # tag's removal is the human's own unblock signal (see
+        # poll-clickup-implement.yml's header comment), not something this workflow
+        # infers from a later run merely completing.
         run: |
           set -uo pipefail
 
@@ -504,12 +537,21 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
-          run_step "git add" git add -A
-          run_step "git commit" git commit -m "Implement ${TICKET_ID}"
-          run_step "git push" git push origin "poc/${TICKET_ID}"
-          run_step "gh pr ready" gh pr ready "poc/${TICKET_ID}"
+          # Retry runs (CI_FAILURE set) get a distinct, greppable commit prefix —
+          # agent-react-to-e2e.yml counts prior occurrences of it on this branch to
+          # enforce MAX_E2E_RETRIES, so the exact wording here is load-bearing, not
+          # cosmetic.
+          if [ -n "$CI_FAILURE" ]; then
+            commit_message="Fix e2e failure: ${TICKET_ID} (attempt ${ATTEMPT_NUMBER})"
+          else
+            commit_message="Implement ${TICKET_ID}"
+          fi
 
-          echo "Ticket ${TICKET_ID}: implementation pushed, PR marked ready for review."
+          run_step "git add" git add -A
+          run_step "git commit" git commit -m "$commit_message"
+          run_step "git push" git push origin "poc/${TICKET_ID}"
+
+          echo "Ticket ${TICKET_ID}: pushed. PR stays in draft until agent-react-to-e2e.yml confirms a green e2e run."
 
       - name: On failure after the lock, flag for a human
         if: failure() && steps.lock.outcome == 'success'
