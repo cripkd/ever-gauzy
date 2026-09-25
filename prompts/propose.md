@@ -9,7 +9,20 @@ Ticket: `ticket.md` in the repo root.
 
 1. Read `ticket.md`.
 2. Explore the codebase enough to identify which capability this
-   touches and where the relevant code lives. Read only.
+   touches and where the relevant code lives. Read only. Find every
+   caller/entry point of the affected function, command, or handler —
+   not just the one path the ticket's reproduction steps happened to
+   describe. A bug report shows *a* way to trigger the bug, never a
+   guarantee that it's the only one.
+
+   - **Don't**: a ticket reproduces a bug through one UI dialog: explore
+     only that dialog's component, propose a fix scoped to it.
+   - **Do**: grep for every caller of the backend command/handler that
+     dialog ultimately submits to — other dialogs, other entry points,
+     API consumers — and state in the proposal which ones the fix
+     actually covers. A backend-level fix that covers every caller is
+     usually more robust than a frontend-level one that covers only the
+     dialog the reporter happened to use.
 3. Run the OpenSpec propose workflow to create a change under
    `openspec/changes/`, with proposal, spec delta, and tasks.
 4. Run `openspec validate --strict` and fix anything it reports.
@@ -45,6 +58,29 @@ Ticket: `ticket.md` in the repo root.
   belong there.
 - If the ticket is too underspecified to write a testable requirement,
   do not guess. Write the proposal stating what is missing and stop.
+- **If the fix's behaviour could plausibly differ by role, permission, or
+  caller identity, state explicitly who is in scope and who is
+  excluded — don't leave it implicit.** A requirement scoped to one role
+  must say so as a requirement, not rely on whichever utility function an
+  implementation happens to call to enforce it as a side effect.
+
+  - **Don't**: "auto-assign the creator to the task they create" (silent
+    about whether this applies when the creator is an Admin/Manager
+    acting on someone else's behalf).
+  - **Do**: "auto-assign the creator when they hold the Employee role;
+    Admin/Manager-created tasks are unaffected, matching how
+    `RequestContext.currentEmployeeId()` already distinguishes the two
+    elsewhere in this codebase."
+- **State what happens when a referenced entity doesn't exist or a
+  lookup fails, not just the happy path.** "Impact" describing only the
+  success case is incomplete for anything that resolves an id (a user, an
+  employee, a record) into a real entity.
+
+  - **Don't**: "include the employee in the members list" (silent on what
+    happens if that employee id doesn't resolve to a real record).
+  - **Do**: "look up the employee by id; if the lookup fails, the request
+    fails with a clear error rather than persisting an unvalidated
+    reference."
 
 ## Output
 

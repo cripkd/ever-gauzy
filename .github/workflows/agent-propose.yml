@@ -395,6 +395,84 @@ jobs:
           result=$(grep -m1 '^RESULT:' "$result_text" | sed 's/^RESULT: *//')
           echo "result=${result}" >> "$GITHUB_OUTPUT"
 
+      - name: Run the propose critique
+        # A second, separately-framed pass over the just-written proposal — see
+        # prompts/propose-critique.md's own header for why this is a distinct
+        # invocation rather than the same pass reviewing itself. Only meaningful
+        # against a real proposal: skipped on insufficient-detail, which is about
+        # to be reverted anyway with nothing coherent to critique.
+        if: steps.agent.outputs.result == 'proposed'
+        id: critique
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          set -euo pipefail
+
+          prompt="$(cat prompts/propose-critique.md)"
+          output_file="${RUNNER_TEMP}/critique-output.txt"
+          model="${CLAUDE_MODEL:-claude-sonnet-5}"
+          echo "Using model: ${model}"
+
+          claude_exit=0
+          claude -p "$prompt" \
+            --model "$model" \
+            --output-format json \
+            --allowed-tools "Read,Write,Edit,Glob,Grep,Bash(openspec:*)" \
+            > "$output_file" 2>&1 || claude_exit=$?
+
+          if [ "$claude_exit" -ne 0 ]; then
+            cat "$output_file"
+            echo "::error::claude (critique) exited with status ${claude_exit}"
+            {
+              echo "claude (critique) exited with status ${claude_exit}."
+              echo
+              tail -c 2000 "$output_file"
+            } > "${RUNNER_TEMP}/failure-reason.txt"
+            exit "$claude_exit"
+          fi
+
+          result_text="${RUNNER_TEMP}/critique-result.txt"
+          jq -r '.result' "$output_file" > "$result_text"
+          cat "$result_text"
+
+          # Accumulated onto whatever "Run the propose agent" already captured, not
+          # overwritten — this workflow now makes two separate Claude invocations,
+          # and the run-record's single `claude` object represents this run's TOTAL
+          # spend, not just whichever invocation happened to run last. awk, not bash
+          # arithmetic: cost_usd is fractional, plain `$(( ))` is integer-only.
+          new_cost=$(jq -r '.total_cost_usd // 0' "$output_file")
+          new_input=$(jq -r '.usage.input_tokens // 0' "$output_file")
+          new_output=$(jq -r '.usage.output_tokens // 0' "$output_file")
+          new_cache_read=$(jq -r '.usage.cache_read_input_tokens // 0' "$output_file")
+          new_cache_creation=$(jq -r '.usage.cache_creation_input_tokens // 0' "$output_file")
+          new_turns=$(jq -r '.num_turns // 0' "$output_file")
+          new_duration=$(jq -r '.duration_ms // 0' "$output_file")
+
+          total_cost=$(awk -v a="${CLAUDE_COST_USD:-0}" -v b="$new_cost" 'BEGIN { print a + b }')
+          total_input=$(awk -v a="${CLAUDE_INPUT_TOKENS:-0}" -v b="$new_input" 'BEGIN { print a + b }')
+          total_output=$(awk -v a="${CLAUDE_OUTPUT_TOKENS:-0}" -v b="$new_output" 'BEGIN { print a + b }')
+          total_cache_read=$(awk -v a="${CLAUDE_CACHE_READ_TOKENS:-0}" -v b="$new_cache_read" 'BEGIN { print a + b }')
+          total_cache_creation=$(awk -v a="${CLAUDE_CACHE_CREATION_TOKENS:-0}" -v b="$new_cache_creation" 'BEGIN { print a + b }')
+          total_turns=$(awk -v a="${CLAUDE_NUM_TURNS:-0}" -v b="$new_turns" 'BEGIN { print a + b }')
+          total_duration=$(awk -v a="${CLAUDE_DURATION_MS:-0}" -v b="$new_duration" 'BEGIN { print a + b }')
+
+          {
+            echo "CLAUDE_COST_USD=${total_cost}"
+            echo "CLAUDE_INPUT_TOKENS=${total_input}"
+            echo "CLAUDE_OUTPUT_TOKENS=${total_output}"
+            echo "CLAUDE_CACHE_READ_TOKENS=${total_cache_read}"
+            echo "CLAUDE_CACHE_CREATION_TOKENS=${total_cache_creation}"
+            echo "CLAUDE_NUM_TURNS=${total_turns}"
+            echo "CLAUDE_DURATION_MS=${total_duration}"
+          } >> "$GITHUB_ENV"
+          # CLAUDE_SESSION_ID/CLAUDE_MODEL_USED deliberately left as whatever the
+          # propose invocation already set — two sessions happened, but the record
+          # only carries one id; the propose session is the more useful one to keep
+          # since it's the one that did the primary drafting work.
+
+          critique_result=$(grep -m1 '^RESULT:' "$result_text" | sed 's/^RESULT: *//') || true
+          echo "result=${critique_result}" >> "$GITHUB_OUTPUT"
+
       - name: Verify nothing changed outside openspec/
         env:
           GH_API_TOKEN: ${{ secrets.GITHUB_TOKEN }}

@@ -43,6 +43,20 @@ Change id: `.change-name` in the repo root. Ticket context (supplementary
      `- [x]` only once its specified behaviour is fully implemented — not
      for partial or deferred work.
 
+     When a task involves resolving an id into a reference to another
+     entity, validate it through that entity's own service rather than
+     constructing an unchecked stub object from the bare id — even if the
+     spec doesn't spell this out. A stub silently persists a dangling
+     reference if the id is stale or wrong; a real lookup surfaces that
+     immediately.
+
+     - **Don't**: `members.push(new Employee({ id: employeeId }))`.
+     - **Do**: `const employee = await this._employeeService.findOneByIdString(employeeId); if (employee) members.push(employee);`
+       — wrapped in the surrounding code's existing error-handling
+       convention (a try/catch with a logged error and a clear failure
+       response is typical in this codebase; match whatever the file
+       you're editing already does, don't invent a new pattern).
+
      Writing a Playwright spec (task 1, always) is a code task like any
      other, with one standing rule beyond matching existing test
      conventions: after every `page.goto()` or in-app navigation, assert
