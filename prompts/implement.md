@@ -91,6 +91,26 @@ Change id: `.change-name` in the repo root. Ticket context (supplementary
      (`expect.poll(...)` or an equivalent retry) rather than reading it
      once immediately after an unrelated visibility check.
 
+     That's the fix only when the state is genuinely there but not yet
+     settled — a different, more basic failure is asserting against
+     client-side state that was never going to appear at all, because it
+     doesn't actually live where a comment or a prior spec assumed.
+     **Verify where session/auth state actually lives before writing an
+     assertion against it — trace the real write path in the frontend
+     code, don't infer it from a plausible-sounding name.** Confirmed
+     necessary on a real run: a spec asserted on
+     `localStorage.getItem('token')`, polled for a full 30s with the
+     employee genuinely logged in the whole time (screenshot confirmed a
+     real authenticated session), and still got `null` — because this
+     app's session token is set via a cookie
+     (`auth-strategy.service.ts` deletes it with `deleteCookie('token', ...)`
+     on logout; nothing in the frontend ever calls
+     `localStorage.setItem('token', ...)`). No amount of polling fixes an
+     assertion against a location the app never writes to.
+     `page.context().cookies()` is the correct Playwright tool for
+     cookie-based session state, not `page.evaluate()` reading
+     `localStorage`.
+
      Before trusting a new spec as a regression guard, trace whether any
      *pre-existing* code path could produce the same observable outcome
      the spec asserts on, independent of the change under test — not just
