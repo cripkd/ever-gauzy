@@ -1,5 +1,19 @@
 import { test, expect } from '@playwright/test';
 
+/**
+ * This spec exercises the create-task UI flow end to end and asserts the created task
+ * renders a member chip for the logged-in employee. It is NOT an isolated regression guard
+ * for `TaskCreateHandler`'s auto-assignment logic (packages/core/.../task-create.handler.ts):
+ * for a plain Employee, `AddTaskDialogComponent.ngOnInit()` already pushes the header's
+ * default-selected employee into `selectedMembers` before this ticket's change, via
+ * `store.selectedEmployee$` (populated by `HeaderComponent.checkEmployeeSelectorVisibility()`)
+ * — so the dialog is likely to submit a non-empty `members` list on this route today,
+ * independent of the server-side default. The isolated regression coverage for the
+ * auto-assignment behavior itself (empty list, append, dedupe, no-op for non-employees) is
+ * `task-create.handler.spec.ts`. This spec still has value: it proves the create flow and the
+ * new `data-testid`s wire up correctly end to end.
+ */
+
 const EMAIL = 'employee@ever.co';
 const PASSWORD = '12345678';
 
@@ -13,7 +27,7 @@ function employeeIdFromToken(token: string): string | null {
 	return payload.employeeId ?? null;
 }
 
-test('employee creating a task with no members selected is self-assigned', async ({ page }) => {
+test('creating a task from the Tasks page renders a member chip for the logged-in employee', async ({ page }) => {
 	await page.goto('/');
 
 	await page.locator('#input-email').fill(EMAIL);
