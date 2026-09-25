@@ -739,8 +739,33 @@ jobs:
             build_exit=0
             lint_exit=0
             projects_csv=$(printf '%s' "$projects" | paste -sd, -)
-            npx nx run-many --target=typecheck,build --projects="$projects_csv" \
-              > "$output_file" 2>&1 || build_exit=$?
+
+            # --max-old-space-size=8192, same as poc-e2e.yml's own build of this
+            # repo's heaviest project (gauzy, the Angular app) — confirmed necessary
+            # on a real run: this call's plain default Node heap ceiling OOM'd
+            # ("JavaScript heap out of memory") building gauzy alongside core/ui-core,
+            # something poc-e2e.yml's own gauzy build already avoids this exact way.
+            # Node invoked directly (not via npx), matching poc-e2e.yml's own
+            # invocation style. One retry on failure, same pattern and reasoning as
+            # poc-e2e.yml's own build step: Nx's cache skips whatever already
+            # finished, so a transient/marginal OOM gets one more shot before this is
+            # treated as a real failure.
+            #
+            # Deliberately NOT also adding poc-e2e.yml's `-c ci` flag here: that build
+            # only ever targets gauzy alone, which defines a "ci" configuration: this
+            # run-many call spans whatever heterogeneous set of projects actually
+            # changed, and core (for one) defines no configurations at all on its
+            # build target — unlike a missing target (which nx silently no-ops), a
+            # missing configuration errors, so a shared -c ci would break plain
+            # library projects instead of skipping them.
+            node --max-old-space-size=8192 ./node_modules/nx/bin/nx.js run-many \
+              --target=typecheck,build --projects="$projects_csv" \
+              > "$output_file" 2>&1 || {
+                echo "::warning::self-check build/typecheck failed — retrying once (nx cache skips finished deps)" >> "$output_file"
+                node --max-old-space-size=8192 ./node_modules/nx/bin/nx.js run-many \
+                  --target=typecheck,build --projects="$projects_csv" \
+                  >> "$output_file" 2>&1 || build_exit=$?
+              }
 
             # lint, one project at a time, scoped to only that project's own changed
             # files that still exist at HEAD — a deleted file can't be passed to
