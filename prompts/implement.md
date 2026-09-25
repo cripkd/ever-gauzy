@@ -43,14 +43,23 @@ Change id: `.change-name` in the repo root. Ticket context (supplementary
      `- [x]` only once its specified behaviour is fully implemented — not
      for partial or deferred work.
 
-     When a task involves resolving an id into a reference to another
-     entity, validate it through that entity's own service rather than
-     constructing an unchecked stub object from the bare id — even if the
-     spec doesn't spell this out. A stub silently persists a dangling
-     reference if the id is stale or wrong; a real lookup surfaces that
+     **An id is a claim, not a fact.** When a task involves resolving an
+     id into a reference to another entity — a user, an employee, a
+     record, anything looked up by id rather than passed by value —
+     validate it through that entity's own service rather than
+     constructing an unchecked stub object from the bare id. This holds
+     even if the spec doesn't spell it out, and even when the id comes
+     from a trusted-seeming source (the current session, `RequestContext`,
+     a JWT claim) rather than raw client input: "this is the current
+     user's own id" tells you the id is authentic, not that the row it
+     names still exists. A stub silently persists a dangling reference if
+     the row behind the id is stale, deleted, or wrong — regardless of
+     how trustworthy the id's origin was; a real lookup surfaces that
      immediately.
 
-     - **Don't**: `members.push(new Employee({ id: employeeId }))`.
+     - **Don't**: `members.push(new Employee({ id: employeeId }))` —
+       including when `employeeId` came from
+       `RequestContext.currentEmployeeId()` rather than the request body.
      - **Do**: `const employee = await this._employeeService.findOneByIdString(employeeId); if (employee) members.push(employee);`
        — wrapped in the surrounding code's existing error-handling
        convention (a try/catch with a logged error and a clear failure
@@ -70,6 +79,32 @@ Change id: `.change-name` in the repo root. Ticket context (supplementary
      an opaque "button never appeared" instead of an immediate, legible
      "never reached this page." Fail at the navigation, not at whatever
      happens to time out next.
+
+     Same principle applies one level deeper for anything read via
+     `page.evaluate()` — `localStorage`, `sessionStorage`, cookies, a
+     global JS variable. A DOM assertion passing (an element became
+     visible) proves the UI updated; it does not prove an
+     asynchronously-persisted piece of app state has also settled — an
+     app can render as "logged in" from in-memory state before its auth
+     store has actually flushed a token to `localStorage`. Playwright's
+     auto-wait doesn't cover this because it isn't a locator. Poll for it
+     (`expect.poll(...)` or an equivalent retry) rather than reading it
+     once immediately after an unrelated visibility check.
+
+     Before trusting a new spec as a regression guard, trace whether any
+     *pre-existing* code path could produce the same observable outcome
+     the spec asserts on, independent of the change under test — not just
+     whether the spec passes. A spec that would pass identically with this
+     ticket's fix reverted isn't proof of anything, however green it runs;
+     this pipeline doesn't run task 1 in isolation before the fix lands
+     (see `pipeline-reference.md`'s note on stage 3+4), so nothing else
+     catches this automatically. Concretely: check whether the UI state
+     the spec drives through (a pre-filled field, a default selection, an
+     existing fallback) could already produce the asserted result on its
+     own — if so, either steer the spec around that path (hit the
+     behavior somewhere the pre-existing default can't reach, e.g. the
+     API directly, or a caller that doesn't get the default) or narrow
+     the assertion to something only the new logic could produce.
    - **Verification-only task** — its entire instruction is to run an
      existing command or suite and check whether it passes ("run the spec
      from task 1.1 and verify it's green", "run lint/typecheck/build and

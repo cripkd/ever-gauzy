@@ -74,10 +74,20 @@ Ticket: `ticket.md` in the repo root.
 - **State what happens when a referenced entity doesn't exist or a
   lookup fails, not just the happy path.** "Impact" describing only the
   success case is incomplete for anything that resolves an id (a user, an
-  employee, a record) into a real entity.
+  employee, a record) into a real entity — an id is a claim, not a fact.
+  This applies even when the id comes from the requester's own session
+  context (e.g. the authenticated user's own employee id) rather than the
+  request body: a session-derived id is authentic, but that says nothing
+  about whether the row it names still exists. Treat "is the id ever
+  missing" and "does the id ever fail to resolve" as two separate
+  questions — a proposal that only answers the first hasn't addressed the
+  second.
 
   - **Don't**: "include the employee in the members list" (silent on what
     happens if that employee id doesn't resolve to a real record).
+  - **Don't**: "the employee id always comes from the authenticated
+    session, so it's always present" (answers whether the id is missing,
+    not whether the row behind it still exists).
   - **Do**: "look up the employee by id; if the lookup fails, the request
     fails with a clear error rather than persisting an unvalidated
     reference."

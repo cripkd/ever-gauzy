@@ -41,7 +41,16 @@ what the first one couldn't do for itself.
    - **Unhandled failure modes.** Does "Impact" (or the spec delta's
      scenarios) address what happens when a referenced entity doesn't
      exist, a lookup fails, or an input is invalid — or does it only
-     describe the happy path?
+     describe the happy path? Check this as **two separate questions**,
+     not one: (1) can the id ever be missing/null, and (2) can the id be
+     present and still fail to resolve to a real row. A spec that only
+     answers (1) — e.g. "this id always comes from the authenticated
+     session, so it's never missing" — has not answered (2); a
+     session-derived id is authentic, not proof the row behind it still
+     exists. Confirmed necessary, not theoretical: a real critique run
+     checked only (1), concluded the failure-mode gap class didn't apply,
+     and missed that the implementation it approved never validated the
+     id against a real lookup at all.
 4. For each gap found, decide which of two things it is:
 
    - **An objective completeness gap** — a real entry point, role
