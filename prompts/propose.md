@@ -63,34 +63,16 @@ Ticket: `ticket.md` in the repo root.
   excluded — don't leave it implicit.** A requirement scoped to one role
   must say so as a requirement, not rely on whichever utility function an
   implementation happens to call to enforce it as a side effect.
-
-  - **Don't**: "auto-assign the creator to the task they create" (silent
-    about whether this applies when the creator is an Admin/Manager
-    acting on someone else's behalf).
-  - **Do**: "auto-assign the creator when they hold the Employee role;
-    Admin/Manager-created tasks are unaffected, matching how
-    `RequestContext.currentEmployeeId()` already distinguishes the two
-    elsewhere in this codebase."
 - **State what happens when a referenced entity doesn't exist or a
-  lookup fails, not just the happy path.** "Impact" describing only the
-  success case is incomplete for anything that resolves an id (a user, an
-  employee, a record) into a real entity — an id is a claim, not a fact.
+  lookup fails, not just the happy path — an id is a claim, not a fact.**
   This applies even when the id comes from the requester's own session
-  context (e.g. the authenticated user's own employee id) rather than the
-  request body: a session-derived id is authentic, but that says nothing
-  about whether the row it names still exists. Treat "is the id ever
-  missing" and "does the id ever fail to resolve" as two separate
-  questions — a proposal that only answers the first hasn't addressed the
-  second.
+  context, not just the request body. Treat "is the id ever missing" and
+  "does the id ever fail to resolve" as two separate questions.
 
-  - **Don't**: "include the employee in the members list" (silent on what
-    happens if that employee id doesn't resolve to a real record).
-  - **Don't**: "the employee id always comes from the authenticated
-    session, so it's always present" (answers whether the id is missing,
-    not whether the row behind it still exists).
-  - **Do**: "look up the employee by id; if the lookup fails, the request
-    fails with a clear error rather than persisting an unvalidated
-    reference."
+  (When exploring code under `packages/core/src/lib/**/*.handler.ts` or
+  `*.service.ts` for either of the two points above, `Read` picks up
+  `.claude/rules/entity-retrieval.md` automatically — worked Don't/Do
+  examples for both live there, no need to re-derive them.)
 
 ## Output
 

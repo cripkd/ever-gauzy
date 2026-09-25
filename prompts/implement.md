@@ -44,87 +44,29 @@ Change id: `.change-name` in the repo root. Ticket context (supplementary
      for partial or deferred work.
 
      **An id is a claim, not a fact.** When a task involves resolving an
-     id into a reference to another entity — a user, an employee, a
-     record, anything looked up by id rather than passed by value —
-     validate it through that entity's own service rather than
-     constructing an unchecked stub object from the bare id. This holds
-     even if the spec doesn't spell it out, and even when the id comes
-     from a trusted-seeming source (the current session, `RequestContext`,
-     a JWT claim) rather than raw client input: "this is the current
-     user's own id" tells you the id is authentic, not that the row it
-     names still exists. A stub silently persists a dangling reference if
-     the row behind the id is stale, deleted, or wrong — regardless of
-     how trustworthy the id's origin was; a real lookup surfaces that
-     immediately.
-
-     - **Don't**: `members.push(new Employee({ id: employeeId }))` —
-       including when `employeeId` came from
-       `RequestContext.currentEmployeeId()` rather than the request body.
-     - **Do**: `const employee = await this._employeeService.findOneByIdString(employeeId); if (employee) members.push(employee);`
-       — wrapped in the surrounding code's existing error-handling
-       convention (a try/catch with a logged error and a clear failure
-       response is typical in this codebase; match whatever the file
-       you're editing already does, don't invent a new pattern).
+     id into a reference to another entity, validate it through that
+     entity's own service rather than constructing an unchecked stub — even
+     when the id comes from a trusted-seeming source (the current session,
+     `RequestContext`) rather than raw client input. If the task is also
+     role/permission-sensitive, that scoping must be a stated behavior, not
+     an incidental side effect. (`Read`ing a matching
+     `packages/core/src/lib/**/*.handler.ts` or `*.service.ts` file picks up
+     `.claude/rules/entity-retrieval.md` automatically — worked Don't/Do
+     examples for both live there.)
 
      Writing a Playwright spec (task 1, always) is a code task like any
-     other, with one standing rule beyond matching existing test
-     conventions: after every `page.goto()` or in-app navigation, assert
-     you've actually landed where you meant to — a heading, breadcrumb, or
-     route-specific element — *before* interacting with anything on that
-     page. Playwright's own locator actions already wait for an element to
-     become actionable; that's not what a silent misnavigation needs. A
-     test that jumps straight to `page.locator(...).click()` after
-     navigating will, if the app lands somewhere else, fail 30 seconds
-     later on an unrelated element that was simply never going to appear —
-     an opaque "button never appeared" instead of an immediate, legible
-     "never reached this page." Fail at the navigation, not at whatever
-     happens to time out next.
-
-     Same principle applies one level deeper for anything read via
-     `page.evaluate()` — `localStorage`, `sessionStorage`, cookies, a
-     global JS variable. A DOM assertion passing (an element became
-     visible) proves the UI updated; it does not prove an
-     asynchronously-persisted piece of app state has also settled — an
-     app can render as "logged in" from in-memory state before its auth
-     store has actually flushed a token to `localStorage`. Playwright's
-     auto-wait doesn't cover this because it isn't a locator. Poll for it
-     (`expect.poll(...)` or an equivalent retry) rather than reading it
-     once immediately after an unrelated visibility check.
-
-     That's the fix only when the state is genuinely there but not yet
-     settled — a different, more basic failure is asserting against
-     client-side state that was never going to appear at all, because it
-     doesn't actually live where a comment or a prior spec assumed.
-     **Verify where session/auth state actually lives before writing an
-     assertion against it — trace the real write path in the frontend
-     code, don't infer it from a plausible-sounding name.** Confirmed
-     necessary on a real run: a spec asserted on
-     `localStorage.getItem('token')`, polled for a full 30s with the
-     employee genuinely logged in the whole time (screenshot confirmed a
-     real authenticated session), and still got `null` — because this
-     app's session token is set via a cookie
-     (`auth-strategy.service.ts` deletes it with `deleteCookie('token', ...)`
-     on logout; nothing in the frontend ever calls
-     `localStorage.setItem('token', ...)`). No amount of polling fixes an
-     assertion against a location the app never writes to.
-     `page.context().cookies()` is the correct Playwright tool for
-     cookie-based session state, not `page.evaluate()` reading
-     `localStorage`.
-
-     Before trusting a new spec as a regression guard, trace whether any
-     *pre-existing* code path could produce the same observable outcome
-     the spec asserts on, independent of the change under test — not just
-     whether the spec passes. A spec that would pass identically with this
-     ticket's fix reverted isn't proof of anything, however green it runs;
-     this pipeline doesn't run task 1 in isolation before the fix lands
-     (see `pipeline-reference.md`'s note on stage 3+4), so nothing else
-     catches this automatically. Concretely: check whether the UI state
-     the spec drives through (a pre-filled field, a default selection, an
-     existing fallback) could already produce the asserted result on its
-     own — if so, either steer the spec around that path (hit the
-     behavior somewhere the pre-existing default can't reach, e.g. the
-     API directly, or a caller that doesn't get the default) or narrow
-     the assertion to something only the new logic could produce.
+     other. Three standing rules, all with worked examples and a confirmed
+     real case in `.claude/rules/e2e-testing.md` and
+     `.claude/rules/frontend-session-state.md` (auto-loaded when you read
+     or write a file under `apps/poc-e2e/tests/`): assert you've actually
+     landed where you meant to after every navigation, before interacting
+     with anything on that page; poll for async-persisted client state
+     (`expect.poll(...)`) instead of reading it once, and verify where that
+     state actually lives (trace the real write path) rather than
+     inferring it from a plausible-sounding name; and before trusting a new
+     spec as a regression guard, trace whether a pre-existing code path
+     could already produce the same observable result independent of the
+     change under test.
    - **Verification-only task** — its entire instruction is to run an
      existing command or suite and check whether it passes ("run the spec
      from task 1.1 and verify it's green", "run lint/typecheck/build and
