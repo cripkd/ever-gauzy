@@ -66,7 +66,10 @@ export class TaskCreateHandler implements ICommandHandler<TaskCreateCommand> {
 			// else's behalf), default-assign them to their own task unless already included.
 			const currentEmployeeId = RequestContext.currentEmployeeId();
 			if (currentEmployeeId && !members.some(({ id }) => id === currentEmployeeId)) {
-				members.push(new Employee({ id: currentEmployeeId }));
+				const currentEmployee = await this._employeeService.findOneByIdString(currentEmployeeId);
+				if (currentEmployee) {
+					members.push(currentEmployee);
+				}
 			}
 
 			// Determine the project based on the provided data

@@ -29,7 +29,10 @@ function makeFakeDeps() {
 			create: jest.fn().mockImplementation(async (data: any) => ({ id: 'task-1', ...data }))
 		},
 		organizationProjectService: { findOneByIdString: jest.fn() },
-		employeeService: { findActiveEmployeesByEmployeeIds: jest.fn().mockResolvedValue([]) },
+		employeeService: {
+			findOneByIdString: jest.fn().mockImplementation(async (id: string) => ({ id })),
+			findActiveEmployeesByEmployeeIds: jest.fn().mockResolvedValue([])
+		},
 		mentionService: { publishMention: jest.fn() },
 		activityLogService: { logActivity: jest.fn() },
 		employeeNotificationService: { publishNotificationEvent: jest.fn() }
@@ -98,6 +101,15 @@ describe('TaskCreateHandler', () => {
 			const memberIds = await createTask(makeFakeDeps(), [{ id: 'emp-1' }]);
 
 			expect(memberIds).toEqual(['emp-1']);
+		});
+
+		it('is not added when the current employee id no longer resolves to a real employee record', async () => {
+			const deps = makeFakeDeps();
+			deps.employeeService.findOneByIdString.mockResolvedValue(null);
+
+			const memberIds = await createTask(deps, []);
+
+			expect(memberIds).toEqual([]);
 		});
 	});
 

@@ -36,8 +36,12 @@ test('creating a task from the Tasks page renders a member chip for the logged-i
 
 	await expect(page.getByTestId('dashboard-container')).toBeVisible({ timeout: 60_000 });
 
+	// The dashboard can render from in-memory state before the auth store has flushed the
+	// token to localStorage, so poll rather than reading it once right after the DOM check.
+	await expect
+		.poll(() => page.evaluate(() => localStorage.getItem('token')), { timeout: 60_000 })
+		.toBeTruthy();
 	const token = await page.evaluate(() => localStorage.getItem('token'));
-	expect(token).toBeTruthy();
 	const employeeId = employeeIdFromToken(token as string);
 	expect(employeeId).toBeTruthy();
 
