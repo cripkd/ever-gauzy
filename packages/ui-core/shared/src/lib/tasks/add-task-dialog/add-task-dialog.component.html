@@ -121,6 +121,7 @@
               type="text"
               nbInput
               [placeholder]="'FORM.PLACEHOLDERS.ADD_TITLE' | translate"
+              data-testid="add-task-title-input"
               />
             </div>
           </div>
@@ -229,7 +230,13 @@
               <button (click)="dialogRef.close()" status="basic" outline class="mr-3" nbButton>
                 {{ 'BUTTONS.CANCEL' | translate }}
               </button>
-              <button (click)="onSave()" [disabled]="form.invalid" status="success" nbButton>
+              <button
+                (click)="onSave()"
+                [disabled]="form.invalid"
+                status="success"
+                nbButton
+                data-testid="add-task-save-button"
+              >
                 {{ 'BUTTONS.SAVE' | translate }}
               </button>
             </nb-card-footer>

@@ -51,13 +51,26 @@ export class TaskCreateHandler implements ICommandHandler<TaskCreateCommand> {
 		try {
 			// Destructure input and triggered event flag from the command
 			const { input, triggeredEvent } = command;
-			const { organizationId, mentionEmployeeIds = [], members = [], ...data } = input;
+			const { organizationId, mentionEmployeeIds = [], members: inputMembers = [], ...data } = input;
 
 			// Retrieve current tenant ID from request context or use input tenant ID
 			const tenantId = RequestContext.currentTenantId() ?? data.tenantId;
 
 			// Retrieve current user from the request context
 			const user = RequestContext.currentUser();
+
+			// Copy rather than mutate the caller-supplied array below.
+			const members = [...inputMembers];
+
+			// When the requester is a plain Employee (not an Admin/Manager acting on someone
+			// else's behalf), default-assign them to their own task unless already included.
+			// No DB round trip here: `.map(({ id }) => new Employee({ id }))` below only ever
+			// reads `.id`, and a lookup would let a stale/deleted employee id (still valid in
+			// the JWT) throw and fail the whole task creation instead of degrading gracefully.
+			const currentEmployeeId = RequestContext.currentEmployeeId();
+			if (currentEmployeeId && !members.some(({ id }) => id === currentEmployeeId)) {
+				members.push(new Employee({ id: currentEmployeeId }));
+			}
 
 			// Determine the project based on the provided data
 			const project = data.projectId
