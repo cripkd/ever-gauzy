@@ -947,8 +947,16 @@ jobs:
           run_step "git push" git push origin "poc/${TICKET_ID}"
 
           echo "Ticket ${TICKET_ID}: pushed. PR stays in draft until agent-react-to-e2e.yml confirms a green e2e run."
-          echo "OUTCOME=implemented" >> "$GITHUB_ENV"
-          echo "CLICKUP_STATUS_AFTER=in progress" >> "$GITHUB_ENV"
+          {
+            echo "OUTCOME=implemented"
+            echo "CLICKUP_STATUS_AFTER=in progress"
+            # For the run-record emit step's COMMIT_SHA — lets the dashboard nest the
+            # e2e run this push triggers under this run, joined purely by commit. See
+            # docs/dashboard-plan.md. Not set on the no-op apply-review path above (it
+            # already `exit 0`s before reaching here) — nothing was pushed there, so
+            # there's no new commit for an e2e run to ever test.
+            echo "COMMIT_SHA=$(git rev-parse HEAD)"
+          } >> "$GITHUB_ENV"
 
       - name: On failure after the lock, flag for a human
         if: failure() && steps.lock.outcome == 'success'
@@ -1009,6 +1017,7 @@ jobs:
           TICKET_ID="${TICKET_ID}" \
           TICKET_TITLE="${TICKET_TITLE:-}" \
           SPEC_ID="${SPEC_ID:-}" \
+          COMMIT_SHA="${COMMIT_SHA:-}" \
           MODE="${MODE}" \
           CAUSED_BY_RUN_ID="${CAUSED_BY_RUN_ID:-}" \
           TRIGGERED_BY="${TRIGGERED_BY:-manual}" \

@@ -583,6 +583,11 @@ jobs:
           run_step "git commit" git commit -m "Propose spec for ${TICKET_ID}"
           run_step "git push" git push origin "poc/${TICKET_ID}"
 
+          # For the run-record emit step's COMMIT_SHA — lets the dashboard nest the e2e
+          # run this push triggers under this run, joined purely by commit, with neither
+          # side needing to know about the other. See docs/dashboard-plan.md.
+          echo "COMMIT_SHA=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+
           title="[${TICKET_ID}] ${TICKET_TITLE}"
           body="Proposes a spec for https://app.clickup.com/t/${TICKET_ID}"
 
@@ -658,6 +663,7 @@ jobs:
           TICKET_ID="${TICKET_ID}" \
           TICKET_TITLE="${TICKET_TITLE:-}" \
           SPEC_ID="${SPEC_ID:-}" \
+          COMMIT_SHA="${COMMIT_SHA:-}" \
           CAUSED_BY_RUN_ID="${CAUSED_BY_RUN_ID:-}" \
           TRIGGERED_BY="${TRIGGERED_BY:-manual}" \
           STARTED_AT="${STARTED_AT:-}" \

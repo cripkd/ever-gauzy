@@ -42,6 +42,33 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 90
     steps:
+      - name: Start run-record timer
+        # Ticket-agnostic by design (see header comment) — not every PR run here belongs
+        # to a poc/<ticket_id> branch (e.g. one opened straight against develop), and a
+        # plain workflow_dispatch run has no PR context to derive a ticket from at all.
+        # TICKET_ID stays empty in both cases; the emit step at the end of the job skips
+        # entirely when it's empty, same pattern agent-react-to-e2e.yml's own job-level
+        # `if:` already uses. COMMIT_SHA comes from the PR context, not `git rev-parse
+        # HEAD` later — the checkout step below checks out the PR's synthetic merge
+        # commit, not the actual branch tip agent-implement.yml/agent-propose.yml
+        # captured their own COMMIT_SHA from; using the PR context here is what makes the
+        # two sides actually match for the dashboard's join. See docs/dashboard-plan.md.
+        env:
+          # Not spliced into the script body directly: github.head_ref is a branch name,
+          # attacker-controlled on a fork PR, and GitHub splices a `${{ }}` expression
+          # into the script's literal source before bash ever runs it — actionlint
+          # flagged exactly this. Routed through env: instead, same fix already applied
+          # elsewhere in this pipeline for the same class of issue.
+          HEAD_REF: ${{ github.head_ref }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          echo "STARTED_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_ENV"
+
+          if [[ "$HEAD_REF" == poc/* ]]; then
+            echo "TICKET_ID=${HEAD_REF#poc/}" >> "$GITHUB_ENV"
+            echo "COMMIT_SHA=${PR_HEAD_SHA}" >> "$GITHUB_ENV"
+          fi
+
       - name: Checkout
         uses: actions/checkout@v5
 
@@ -213,3 +240,41 @@ jobs:
           name: e2e-report
           path: apps/poc-e2e/playwright-report/
           retention-days: 14
+
+      - name: Emit run record
+        # Gated on TICKET_ID being set (a poc/<ticket_id> branch) — see the "Start
+        # run-record timer" step's comment for why a plain develop-targeted PR or a
+        # manual workflow_dispatch run produces no record at all.
+        if: always() && env.TICKET_ID != ''
+        continue-on-error: true
+        run: |
+          set -uo pipefail
+
+          case "${{ job.status }}" in
+            success) outcome="success" ;;
+            cancelled) outcome="cancelled" ;;
+            *) outcome="failed" ;;
+          esac
+
+          RUN_ID="${{ github.run_id }}-${{ github.run_attempt }}" \
+          RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+          WORKFLOW="poc-e2e" \
+          EVENT_TYPE="${{ github.event_name }}" \
+          TICKET_ID="${TICKET_ID}" \
+          COMMIT_SHA="${COMMIT_SHA:-}" \
+          TRIGGERED_BY="pull_request" \
+          STARTED_AT="${STARTED_AT:-}" \
+          FINISHED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+          OUTCOME="$outcome" \
+            node .github/scripts/record-run.mjs > "${RUNNER_TEMP}/run-record.json"
+
+          cat "${RUNNER_TEMP}/run-record.json"
+
+      - name: Upload run record
+        if: always() && env.TICKET_ID != ''
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: run-record-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/run-record.json
+          retention-days: 90

@@ -63,6 +63,11 @@ const record = {
 	ticket_id: required('TICKET_ID'),
 	ticket_title: str('TICKET_TITLE'),
 	spec_id: str('SPEC_ID'),
+	// The commit a push produced (implement/propose), or the commit an e2e run tested
+	// (poc-e2e) — not a dispatch relationship like caused_by_run_id, a second, independent
+	// join key the dashboard uses to nest an e2e run under whichever agent run produced
+	// the commit it's testing. Neither side needs to know about the other at write time.
+	commit_sha: str('COMMIT_SHA'),
 	mode: str('MODE'),
 	caused_by_run_id: str('CAUSED_BY_RUN_ID'),
 	triggered_by: str('TRIGGERED_BY'),
