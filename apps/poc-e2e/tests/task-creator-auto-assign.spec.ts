@@ -46,7 +46,11 @@ test('Employee creating a task and selecting another member is assigned alongsid
 
 	await page.locator('ga-employee-multi-select nb-select button.select-button').click();
 	await page.locator('.option-list nb-option', { hasText: OTHER_EMPLOYEE_NAME }).click();
-	await page.keyboard.press('Escape');
+	// NOT Escape: ngx-add-task-dialog opens with NbDialog defaults (closeOnEsc=true), so a
+	// document-level Escape closes the whole dialog, not just the open nb-select panel (same
+	// gotcha as apps/gauzy-e2e/src/support/Base/pageobjects/PaymentsPageObject.ts). Clicking the
+	// inert dialog title closes the dropdown without touching the dialog.
+	await page.locator('ngx-add-task-dialog nb-card-header .title').click();
 
 	await page.locator('nb-card-footer > button[status="success"]').click();
 
