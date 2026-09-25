@@ -22,11 +22,25 @@ was; a real lookup surfaces that immediately.
 - **Don't**: `members.push(new Employee({ id: employeeId }))` — including
   when `employeeId` came from `RequestContext.currentEmployeeId()` rather
   than the request body.
-- **Do**: `const employee = await this._employeeService.findOneByIdString(employeeId); if (employee) members.push(employee);`
-  — wrapped in the surrounding code's existing error-handling convention (a
-  try/catch with a logged error and a clear failure response is typical in
-  this codebase; match whatever the file you're editing already does,
-  don't invent a new pattern).
+- **Don't** (confirmed a real, shipped bug, not theoretical):
+  `const employee = await this._employeeService.findOneByIdString(employeeId); if (employee) members.push(employee);`
+  — this *looks* like a validated lookup, but `CrudService`'s
+  `findOneByIdString`/`findOneByOptions` (`crud.service.ts`) throws
+  `NotFoundException` when nothing matches; it never resolves to `null` or
+  falsy. The `if (employee)` guard is dead code. A real, posted review
+  caught exactly this: an unhandled `NotFoundException` propagates to the
+  handler's outer `catch` and turns the *entire request* into a hard
+  failure — often a worse outcome than the stub it was meant to replace,
+  and the opposite of "degrade gracefully" if that's the intended
+  behavior here.
+- **Do**: wrap the lookup in its own `try`/`catch` and decide deliberately
+  what a missing entity means for *this* request — re-throw a clear error
+  if the whole operation should fail, or log-and-continue without adding
+  the reference if graceful degradation is the intended behavior (state
+  which one explicitly; don't leave it implicit). Match whatever
+  error-handling convention the surrounding file already uses rather than
+  inventing a new one — the point is a deliberate decision either way, not
+  a specific shape.
 
 ## State role/permission scoping explicitly
 
