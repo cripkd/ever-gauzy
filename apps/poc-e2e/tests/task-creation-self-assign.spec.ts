@@ -18,9 +18,9 @@ const EMAIL = 'employee@ever.co';
 const PASSWORD = '12345678';
 
 /**
- * Decodes the `employeeId` claim out of the app's JWT, without a network round trip.
+ * Decodes the `employeeId` claim out of the app's JWT.
  * `AuthService` (packages/core/src/lib/auth/auth.service.ts) embeds it directly in the
- * token payload, and the frontend stores that token verbatim under localStorage `token`.
+ * token payload.
  */
 function employeeIdFromToken(token: string): string | null {
 	const payload = JSON.parse(Buffer.from(token.split('.')[1], 'base64').toString('utf-8'));
@@ -32,18 +32,20 @@ test('creating a task from the Tasks page renders a member chip for the logged-i
 
 	await page.locator('#input-email').fill(EMAIL);
 	await page.locator('#input-password').fill(PASSWORD);
-	await page.locator('button[type="submit"]').click();
 
-	await expect(page.getByTestId('dashboard-container')).toBeVisible({ timeout: 60_000 });
-
-	// The dashboard can render from in-memory state before the auth store has flushed the
-	// token to localStorage, so poll rather than reading it once right after the DOM check.
-	await expect
-		.poll(() => page.evaluate(() => localStorage.getItem('token')), { timeout: 60_000 })
-		.toBeTruthy();
-	const token = await page.evaluate(() => localStorage.getItem('token'));
+	// The session token lives only in the login API response and in-memory Akita state
+	// (`TokenInterceptor` reads `Store.token` to build the `Authorization` header) — it is
+	// never written to localStorage or a cookie anywhere in the frontend, so the login
+	// response body is the only reliable place to read it from.
+	const [loginResponse] = await Promise.all([
+		page.waitForResponse((res) => res.url().includes('/api/auth/login') && res.request().method() === 'POST'),
+		page.locator('button[type="submit"]').click()
+	]);
+	const { token } = await loginResponse.json();
 	const employeeId = employeeIdFromToken(token as string);
 	expect(employeeId).toBeTruthy();
+
+	await expect(page.getByTestId('dashboard-container')).toBeVisible({ timeout: 60_000 });
 
 	await page.goto('/pages/tasks/dashboard');
 	await expect(page.getByTestId('add-task-trigger')).toBeVisible({ timeout: 60_000 });
