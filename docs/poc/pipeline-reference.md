@@ -21,19 +21,28 @@ assumed.
 | 3+4 | Failing test + Implement (one agent — see note) | `poll-clickup-implement.yml` → `agent-implement.yml`         | `ready for dev` → `in progress`              | Branch pushed: failing spec + implementation together      | Self-check (lint/typecheck/build, scoped to directly-touched projects) passes | CI             |
 | 5   | Verify            | `poc-e2e.yml` (CI) → `agent-react-to-e2e.yml` (reacts)       | `in progress` → `ready for review` (on green) | PR undrafted; screenshots/trace/HTML report on failure     | Whole accumulated Playwright suite green, for the exact pushed commit         | CI             |
 | 6   | Review            | `poll-clickup-review.yml` → `agent-review.yml`               | `ready for review` → `in review`             | GitHub PR review (AI-authored comments)                    | Review posted; you decide                                                   | **Human**      |
-| 6b  | Apply review feedback (optional) | `poll-clickup-apply-review.yml` → `agent-implement.yml` (`MODE=apply-review`) | `in review` → `in progress` → (via stage 5's reactor) `ready for review` | Same branch, review-comment-driven push (or a no-op if nothing was actionable) | Same as stage 3+4's self-check, then stage 5's e2e gate again | CI + **Human** |
-| 7   | Merge             | **Not built yet**                                           | `in review` → `ready for deploy` → `complete`| —                                                            | —                                                                             | —              |
+| 6b  | Apply review feedback (optional) | `poll-clickup-merge.yml` → `agent-merge.yml` (triage) → `agent-implement.yml` (`MODE=apply-review`), if triage finds actionable feedback | `in review` → `in progress` → (via stage 5's reactor) `ready for review` | Same branch, review-comment-driven push (or a no-op if nothing was actionable) | Same as stage 3+4's self-check, then stage 5's e2e gate again | CI + **Human** |
+| 7   | Merge             | `poll-clickup-merge.yml` → `agent-merge.yml`, if triage finds nothing actionable | `in review` → `ready for deploy`             | OpenSpec change archived into `openspec/specs/`; PR merged into `develop` | No actionable review items remain (triage, capped at `MAX_APPLY_REVIEW_ROUNDS`) | CI             |
 
-**Note on stage 6b:** Two ways to address review feedback, same human/AI choice pattern as
-every other stage — no new status either way. A human can just push a fixed commit to
-`poc/<ticket_id>` directly (the stage 5 reactor already reacts to any push on a ticket
-branch regardless of who made it). Or they re-add `for-ai` while the ticket sits at
-`in review`, and `agent-implement.yml` runs again in `apply-review` mode: same workflow,
-a different prompt (`prompts/apply-review.md`), fetching the PR's actual review comments
-fresh from GitHub rather than through the dispatch payload — agnostic to whether the
-comments came from `agent-review.yml` or a human reviewing directly on GitHub. `in
-progress` is reused as the transient state either way, which is why stage 5's reactor
-needed no changes to also close this loop.
+**Note on stages 6b and 7:** One entry point for both, not two — `in review` + `for-ai`
+is a single human gesture ("look at this again") that can mean either "apply my review
+feedback" or "nothing left to fix, merge it," and only reading the posted review against
+the current diff can tell which. `poll-clickup-merge.yml` is the sole poller on that
+(status, tag) pair; it dispatches `agent-merge.yml`, which runs a narrowly-scoped triage
+pass (`prompts/merge-triage.md`) to decide. Actionable feedback → it dispatches
+`clickup-apply-review` to `agent-implement.yml`, same workflow and prompt
+(`prompts/apply-review.md`) this always used, just triggered one hop later than before —
+fetching the PR's actual review comments fresh from GitHub, agnostic to whether they came
+from `agent-review.yml` or a human reviewing directly on GitHub. `in progress` is reused
+as the transient state, same as always, so stage 5's reactor needed no changes to close
+this loop. Nothing actionable → `agent-merge.yml` does the archive/merge itself: no
+apply-review round, no self-check, no e2e re-run — there's nothing new to verify. A human
+can still bypass either path by pushing a fixed commit to `poc/<ticket_id>` directly (the
+stage 5 reactor reacts to any push regardless of who made it) instead of re-tagging
+`for-ai`. The triage/apply-review loop is capped (`MAX_APPLY_REVIEW_ROUNDS`, counted via
+`agent-implement.yml`'s own `"Address review feedback: <ticket>"` commit prefix) so a
+triage pass that keeps finding actionable items doesn't spin silently — it tags
+`needs-human` instead once the cap is hit.
 
 **Note on stage 3+4:** `propose.md` still writes `tasks.md` with task 1 as
 the failing Playwright spec, ordered first, same as always — but
@@ -157,15 +166,17 @@ Done. Stages, gates, run-log schema, deferred decisions with triggers.
 
 ### Step 2 — walking skeleton
 
-Superseded by building full automation directly (stages 1–6b) rather than
+Superseded by building full automation directly (stages 1–7) rather than
 one manual, by-hand walkthrough. Ticket `869f5qg9d` (a real,
 replayed-closed bug — task creation not assigning the creating employee)
 is the live end-to-end exercise instead: intake, spec, implement, and e2e
 verification done (including one real retry cycle after a self-check OOM
 was found and fixed); a real AI review has now posted (raised a missing
 unit-test-coverage concern and flagged the run's own unchecked
-verification tasks); stage 6b (apply review feedback) is built but not
-yet exercised on this ticket; stage 7 not built.
+verification tasks); stages 6b and 7 (apply review feedback; merge/archive
+— one shared entry point, see the note above) are built but not yet
+exercised on any ticket — no ticket has reached `in review` with `for-ai`
+re-added since they were built.
 
 ---
 

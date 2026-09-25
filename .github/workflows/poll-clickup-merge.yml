@@ -1,24 +1,25 @@
-name: Poll ClickUp Apply Review
+name: Poll ClickUp Merge
 
-# Finds ClickUp tasks whose review feedback a human wants AI to apply (status:
-# in review, tag: for-ai re-added after agent-review.yml's own lock consumed the
-# original one) and dispatches one clickup-apply-review run per task, for
-# agent-implement.yml to pick up in its apply-review mode.
+# Finds ClickUp tasks a human has tagged "for-ai" while sitting "in review" and
+# dispatches one clickup-merge run per task, for agent-merge.yml to pick up.
 #
-# Same shape as poll-clickup-review.yml: no separate marker field — the dispatch lock
-# lives entirely in agent-implement.yml itself (same lock it already uses for a normal
-# implement dispatch: PUT status -> in progress, remove for-ai), which takes the task
-# out of this poller's own statuses[]=in%20review filter.
+# This is the SOLE poller on (status: in review, tag: for-ai) — it replaces what used
+# to be poll-clickup-apply-review.yml. That old poller and this one can't coexist: both
+# would match the exact same (status, tag) pair, and two independent cron pollers racing
+# to dispatch the same ticket is a real double-dispatch risk, not a theoretical one. The
+# same human gesture (re-adding for-ai at "in review") now always lands here first;
+# agent-merge.yml itself decides — by actually reading the posted review against the
+# current diff, since nothing in this pipeline posts a structured approve/request-changes
+# signal (agent-review.yml always posts via `gh pr review --comment`) — whether that
+# means "apply the review feedback" (it re-dispatches clickup-apply-review to
+# agent-implement.yml, unchanged, exactly as the old poller used to do directly) or
+# "nothing left to fix, merge it" (it does the actual openspec archive + gh pr merge
+# itself). See prompts/merge-triage.md and docs/poc/pipeline-reference.md.
 #
-# One extra filter beyond the status, client-side after the fetch: requires the
-# "for-ai" tag, same as every other poller — a human re-adds it deliberately to signal
-# "let AI apply these fixes"; without it, the ticket sits at "in review" for a human to
-# address themselves (just pushing a commit directly, which the existing e2e reactor
-# already reacts to regardless of who pushed it — see agent-react-to-e2e.yml's own guard
-# comment). No exclusion tag: a blocked apply-review run reverts status to "in review"
-# without tagging anything that would need excluding here — its own lock already
-# consumed for-ai on the way in, which is what keeps a casual re-poll from re-dispatching
-# into the same blocker (see agent-implement.yml's "Handle blocked result" step).
+# Same shape as poll-clickup-review.yml/the old poll-clickup-apply-review.yml: no
+# separate marker field — the dispatch lock lives entirely in agent-merge.yml itself
+# (DELETE the for-ai tag, no status PUT — status stays "in review" either way, so no
+# other poller's filter needs disambiguating from that).
 #
 # This workflow never writes to ClickUp — only reads, then dispatches via the GitHub API.
 
@@ -28,7 +29,7 @@ on:
   workflow_dispatch:
 
 concurrency:
-  group: poll-clickup-apply-review
+  group: poll-clickup-merge
   cancel-in-progress: false
 
 permissions: {}
@@ -121,11 +122,11 @@ jobs:
           for ((i = 0; i < dispatch_count; i++)); do
             ticket_id="${ids[$i]}"
 
-            # caused_by_run_id + triggered_by feed agent-implement.yml's own run-record
-            # emit step (apply-review mode). See docs/dashboard-plan.md.
+            # caused_by_run_id + triggered_by feed agent-merge.yml's own run-record
+            # emit step. See docs/dashboard-plan.md.
             payload=$(jq -n --arg ticket_id "$ticket_id" \
               --arg caused_by_run_id "${{ github.run_id }}-${{ github.run_attempt }}" \
-              '{event_type: "clickup-apply-review", client_payload: {ticket_id: $ticket_id, caused_by_run_id: $caused_by_run_id, triggered_by: "poller"}}')
+              '{event_type: "clickup-merge", client_payload: {ticket_id: $ticket_id, caused_by_run_id: $caused_by_run_id, triggered_by: "poller"}}')
 
             http_code=$(curl -sS -o dispatch-response.json -w '%{http_code}' \
               -X POST \
@@ -142,7 +143,7 @@ jobs:
             fi
 
             dispatched=$((dispatched + 1))
-            echo "Dispatched clickup-apply-review for ticket ${ticket_id} (${dispatched}/${dispatch_count})"
+            echo "Dispatched clickup-merge for ticket ${ticket_id} (${dispatched}/${dispatch_count})"
           done
 
           echo "Done: dispatched ${dispatched} of ${total} matched task(s)."

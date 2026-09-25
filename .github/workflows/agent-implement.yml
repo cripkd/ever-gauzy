@@ -4,8 +4,9 @@ name: Agent Implement
 #   - poll-clickup-implement.yml: a fresh ticket, "ready for dev" (MODE=implement)
 #   - agent-react-to-e2e.yml: a retry, after a red e2e result on a prior push from this
 #     same workflow (MODE=implement, CI_FAILURE set)
-#   - poll-clickup-apply-review.yml: a human re-added "for-ai" at "in review" to have AI
-#     apply review feedback (MODE=apply-review)
+#   - agent-merge.yml: a human re-added "for-ai" at "in review"; agent-merge.yml's own
+#     triage decided the posted review still has actionable feedback and dispatched
+#     this (MODE=apply-review) rather than proceeding straight to archive/merge
 # All three execute against the real codebase, on the same poc/<ticket_id> branch and
 # draft PR agent-propose.yml created, and push the result. See prompts/implement.md
 # (MODE=implement) or prompts/apply-review.md (MODE=apply-review) for Claude's exact
@@ -555,9 +556,10 @@ jobs:
           # poll-clickup-implement.yml from picking it straight back up. An apply-review
           # run reverts to "in review" instead — this ticket already went through review;
           # sending it all the way back to "ready for dev" would skip past that. No
-          # equivalent exclusion tag is needed there: this run's own lock step already
-          # consumed "for-ai" before Claude ever ran, so the ticket is already un-pollable
-          # by poll-clickup-apply-review.yml the moment it blocks — a human has to
+          # equivalent exclusion tag is needed there: "for-ai" was already consumed by
+          # agent-merge.yml's own lock before it ever dispatched this run (this run's own
+          # lock step removes it again too, harmlessly), so the ticket is already
+          # un-pollable by poll-clickup-merge.yml the moment it blocks — a human has to
           # deliberately re-add "for-ai" to retry either way.
           if [ "$MODE" = "apply-review" ]; then
             revert_status="in review"

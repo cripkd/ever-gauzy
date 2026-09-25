@@ -1,0 +1,551 @@
+name: Agent Merge
+
+# Fires once per clickup-merge dispatch from poll-clickup-merge.yml — the sole watcher
+# of (status: in review, tag: for-ai). That one human gesture used to mean only "apply
+# review feedback" (poll-clickup-apply-review.yml, now retired); it can now also mean
+# "nothing left to fix, merge it" — this workflow is what decides which, every run.
+#
+# Flow:
+#   1. DELETE the "for-ai" tag. FIRST action, before checkout — dispatch lock, same
+#      reasoning as every other agent: poll-clickup-merge.yml's own statuses[]=in%20review
+#      + for-ai filter can't re-match this ticket once the tag is gone. No ClickUp status
+#      PUT here, unlike every other agent's lock — status stays "in review" for the whole
+#      run either way, so there's no ambiguity with any other poller's own filter to avoid.
+#   2. Full checkout (fetch-depth: 0), check out the EXISTING poc/<ticket_id> branch (this
+#      workflow never creates one — a ticket can't reach "in review" without having gone
+#      through implement first). Fetch the PR's actual review comments fresh from GitHub
+#      (gh pr view --json reviews), same call and same reasoning as agent-implement.yml's
+#      apply-review mode — works the same whether the review came from agent-review.yml or
+#      a human reviewing directly on GitHub. Fails outright if there's nothing there.
+#   3. Install Claude Code and the openspec CLI. No node_modules restore — this workflow
+#      never builds or runs the app; openspec archive only touches openspec/ markdown.
+#   4. Resolve the one OpenSpec change on this branch via `openspec list --json` (same as
+#      agent-implement.yml step 4).
+#   5. claude -p, prompts/merge-triage.md, --allowed-tools
+#      "Read,Grep,Glob,Bash(openspec:*),Bash(git diff:*),Bash(git log:*),Bash(git show:*)"
+#      — read-only, same spirit as agent-review.yml's own scope. Answers one question:
+#      does the posted review, against the diff as it stands right now, still need a code
+#      change? RESULT: needs-changes | ready-to-merge. See prompts/merge-triage.md for the
+#      classification rubric and the explicit guard against always finding something to
+#      flag — this was a real design concern, not an afterthought.
+#   6. RESULT: needs-changes -> capped the same way agent-react-to-e2e.yml caps its own
+#      retry loop: count prior apply-review commits on this branch via their existing
+#      fixed prefix ("Address review feedback: <ticket>") against
+#      MAX_APPLY_REVIEW_ROUNDS. Under the cap: repository_dispatch clickup-apply-review,
+#      same event agent-implement.yml already handles unchanged, same payload shape the
+#      old poller used to send directly. At or past the cap: tag needs-human, comment
+#      explaining the round count, leave status at "in review" — a loop that never
+#      converges surfaces to a human instead of spinning forever.
+#      RESULT: ready-to-merge -> openspec archive, commit + push, gh pr merge (--merge,
+#      matching this fork's own merge-commit convention, not squash) --delete-branch,
+#      ClickUp status -> "ready for deploy", comment with the PR link.
+#   7. Any failure from step 2 onward: tag "needs-human" + comment with the run URL, same
+#      generic catch-all every other agent uses.
+
+on:
+  repository_dispatch:
+    types: [clickup-merge]
+  workflow_dispatch:
+    inputs:
+      ticket_id:
+        description: ClickUp ticket id (for a manual re-run after a blocked/failed run)
+        required: true
+
+concurrency:
+  group: agent-merge-${{ github.event.client_payload.ticket_id || inputs.ticket_id }}
+  cancel-in-progress: false
+
+permissions:
+  # No pull-requests: write — the actual PR merge goes through DISPATCH_PAT below, not
+  # this token. Same reasoning agent-implement.yml/agent-review.yml/agent-react-to-e2e.yml
+  # already document for their own PR-touching steps.
+  contents: write
+
+env:
+  TICKET_ID: ${{ github.event.client_payload.ticket_id || inputs.ticket_id }}
+  CLAUDE_MODEL: ${{ vars.CLAUDE_MODEL }}
+  MAX_APPLY_REVIEW_ROUNDS: 3
+  # Blank on a manual workflow_dispatch run — the run-record emit step falls back to
+  # "manual" for TRIGGERED_BY in that case. See docs/dashboard-plan.md.
+  CAUSED_BY_RUN_ID: ${{ github.event.client_payload.caused_by_run_id }}
+  TRIGGERED_BY: ${{ github.event.client_payload.triggered_by }}
+
+jobs:
+  merge:
+    name: Triage the review, then apply feedback or merge
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Remove the for-ai tag (dispatch lock)
+        id: lock
+        env:
+          CLICKUP_API_TOKEN: ${{ secrets.CLICKUP_API_TOKEN }}
+        run: |
+          # Captured unconditionally, before `set -euo pipefail` even engages — same
+          # reasoning as every other agent's identical line.
+          echo "STARTED_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_ENV"
+
+          set -euo pipefail
+
+          # No status PUT here — see header comment. Best effort, not gated on http_code:
+          # there's nothing before this to have already committed to a lock that a failed
+          # tag removal would need to roll back.
+          tag_remove_code=$(curl -sS -o /dev/null -w '%{http_code}' \
+            -X DELETE \
+            -H "Authorization: ${CLICKUP_API_TOKEN}" \
+            "https://api.clickup.com/api/v2/task/${TICKET_ID}/tag/for-ai" || true)
+          echo "Ticket ${TICKET_ID}: removed \"for-ai\" tag (HTTP ${tag_remove_code})."
+
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Capture the merge-triage prompt
+        # Must happen BEFORE the branch switch below, and land outside the repo checkout
+        # — see agent-implement.yml's identical step for why: poc/<ticket_id> may predate
+        # this file or record-run.mjs entirely.
+        run: |
+          set -euo pipefail
+
+          cp prompts/merge-triage.md "${RUNNER_TEMP}/merge-triage-prompt.md"
+          cp .github/scripts/record-run.mjs "${RUNNER_TEMP}/record-run.mjs"
+
+      - name: Check out the existing implementation branch
+        run: |
+          set -euo pipefail
+
+          branch="poc/${TICKET_ID}"
+
+          if ! git fetch origin "$branch"; then
+            reason="Branch ${branch} does not exist on origin — this ticket reached \"in review\" without ever going through implement (or the branch was deleted since). Nothing to triage."
+            echo "::error::${reason}"
+            echo "$reason" > "${RUNNER_TEMP}/failure-reason.txt"
+            exit 1
+          fi
+
+          git checkout -B "$branch" "origin/$branch"
+
+      - name: Fetch review comments
+        env:
+          # Same DISPATCH_PAT every gh pr call in this pipeline uses; unverified
+          # specifically for a read-only `gh pr view` — same caveat
+          # agent-implement.yml's identical step already carries, still true here.
+          GH_TOKEN: ${{ secrets.DISPATCH_PAT }}
+        run: |
+          set -euo pipefail
+
+          reviews_json=$(gh pr view "poc/${TICKET_ID}" --json reviews -R "${{ github.repository }}")
+
+          # Every review round, not just the latest — see agent-implement.yml's
+          # identical step for why. `|| true` + explicit empty check, same reasoning.
+          body=$(echo "$reviews_json" | jq -r '
+            [.reviews[] | select(.body != "")]
+            | map("### \(.author.login) (\(.state)) — \(.submittedAt)\n\n\(.body)")
+            | join("\n\n---\n\n")
+          ') || true
+
+          if [ -z "$body" ]; then
+            reason="No PR review found on poc/${TICKET_ID} — nothing to triage. (for-ai may have been re-added without leaving a review comment first.)"
+            echo "::error::${reason}"
+            echo "$reason" > "${RUNNER_TEMP}/failure-reason.txt"
+            exit 1
+          fi
+
+          printf '%s\n' "$body" > .review-comments.md
+          echo ".review-comments.md" >> .git/info/exclude
+
+          echo "Wrote .review-comments.md ($(echo "$reviews_json" | jq '[.reviews[] | select(.body != "")] | length') review(s))."
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: Install the Claude Code and openspec CLIs
+        run: |
+          npm install -g @anthropic-ai/claude-code
+          npm install -g @fission-ai/openspec
+
+      - name: Resolve the OpenSpec change
+        run: |
+          set -euo pipefail
+
+          list_json="${RUNNER_TEMP}/openspec-list.json"
+          if ! openspec list --json > "$list_json" 2> "${RUNNER_TEMP}/openspec-list.err"; then
+            reason="openspec list --json failed:
+          $(cat "${RUNNER_TEMP}/openspec-list.err")"
+            echo "::error::${reason}"
+            echo "$reason" > "${RUNNER_TEMP}/failure-reason.txt"
+            exit 1
+          fi
+
+          count=$(jq '.changes | length' "$list_json")
+          if [ "$count" -ne 1 ]; then
+            reason="Expected exactly one active OpenSpec change on poc/${TICKET_ID}, found ${count}:
+          $(jq -r '.changes[].name' "$list_json")"
+            echo "::error::${reason}"
+            echo "$reason" > "${RUNNER_TEMP}/failure-reason.txt"
+            exit 1
+          fi
+
+          change_name=$(jq -r '.changes[0].name' "$list_json")
+          echo "Resolved OpenSpec change: ${change_name}"
+          echo "$change_name" > .change-name
+          echo "SPEC_ID=${change_name}" >> "$GITHUB_ENV"
+          echo ".change-name" >> .git/info/exclude
+
+      - name: Write the ticket to ticket.md
+        env:
+          CLICKUP_API_TOKEN: ${{ secrets.CLICKUP_API_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          task_json="${RUNNER_TEMP}/task.json"
+
+          http_code=$(curl -sS -o "$task_json" -w '%{http_code}' \
+            -H "Authorization: ${CLICKUP_API_TOKEN}" \
+            "https://api.clickup.com/api/v2/task/${TICKET_ID}" || true)
+
+          if [ "$http_code" -lt 200 ] || [ "$http_code" -ge 300 ]; then
+            echo "::error::ClickUp GET task returned HTTP ${http_code}"
+            cat "$task_json"
+            {
+              echo "ClickUp GET task returned HTTP ${http_code}."
+              echo
+              cat "$task_json"
+            } > "${RUNNER_TEMP}/failure-reason.txt"
+            exit 1
+          fi
+
+          jq -r '.description // ""' "$task_json" > ticket.md
+          echo "ticket.md" >> .git/info/exclude
+
+          {
+            echo "TICKET_TITLE<<TICKET_TITLE_EOF"
+            jq -r '.name // ""' "$task_json"
+            echo "TICKET_TITLE_EOF"
+          } >> "$GITHUB_ENV"
+
+      - name: Trust the workspace for Claude Code
+        run: |
+          set -euo pipefail
+
+          real_path=$(pwd -P)
+          claude_config="${HOME}/.claude.json"
+
+          existing='{}'
+          if [ -f "$claude_config" ]; then
+            existing=$(cat "$claude_config")
+          fi
+
+          printf '%s' "$existing" \
+            | jq --arg path "$real_path" '.projects[$path].hasTrustDialogAccepted = true' \
+            > "$claude_config"
+
+      - name: Run the merge triage agent
+        id: agent
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          set -euo pipefail
+
+          prompt="$(cat "${RUNNER_TEMP}/merge-triage-prompt.md")"
+          output_file="${RUNNER_TEMP}/claude-output.txt"
+          model="${CLAUDE_MODEL:-claude-sonnet-5}"
+          echo "Using model: ${model}"
+
+          claude_exit=0
+          claude -p "$prompt" \
+            --model "$model" \
+            --output-format json \
+            --allowed-tools "Read,Grep,Glob,Bash(openspec:*),Bash(git diff:*),Bash(git log:*),Bash(git show:*)" \
+            > "$output_file" 2>&1 || claude_exit=$?
+
+          if [ "$claude_exit" -ne 0 ]; then
+            cat "$output_file"
+            echo "::error::claude exited with status ${claude_exit}"
+            {
+              echo "claude exited with status ${claude_exit}."
+              echo
+              tail -c 2000 "$output_file"
+            } > "${RUNNER_TEMP}/failure-reason.txt"
+
+            jq -r '"CLAUDE_SESSION_ID=" + (.session_id // ""),
+                   "CLAUDE_MODEL_USED=" + ((.modelUsage // {}) | keys | last // ""),
+                   "CLAUDE_COST_USD=" + ((.total_cost_usd // "") | tostring),
+                   "CLAUDE_INPUT_TOKENS=" + ((.usage.input_tokens // "") | tostring),
+                   "CLAUDE_OUTPUT_TOKENS=" + ((.usage.output_tokens // "") | tostring),
+                   "CLAUDE_CACHE_READ_TOKENS=" + ((.usage.cache_read_input_tokens // "") | tostring),
+                   "CLAUDE_CACHE_CREATION_TOKENS=" + ((.usage.cache_creation_input_tokens // "") | tostring),
+                   "CLAUDE_NUM_TURNS=" + ((.num_turns // "") | tostring),
+                   "CLAUDE_DURATION_MS=" + ((.duration_ms // "") | tostring)' \
+              "$output_file" >> "$GITHUB_ENV" 2>/dev/null || true
+
+            exit "$claude_exit"
+          fi
+
+          result_text="${RUNNER_TEMP}/claude-result.txt"
+          jq -r '.result' "$output_file" > "$result_text"
+          cat "$result_text"
+
+          jq -c '{session_id, model: ((.modelUsage // {}) | keys | last), cost_usd: .total_cost_usd,
+                  input_tokens: .usage.input_tokens, output_tokens: .usage.output_tokens,
+                  cache_read_tokens: .usage.cache_read_input_tokens,
+                  cache_creation_tokens: .usage.cache_creation_input_tokens,
+                  num_turns, duration_ms}' "$output_file" > "${RUNNER_TEMP}/claude-usage.json"
+
+          jq -r '"CLAUDE_SESSION_ID=" + (.session_id // ""),
+                 "CLAUDE_MODEL_USED=" + (.model // ""),
+                 "CLAUDE_COST_USD=" + ((.cost_usd // "") | tostring),
+                 "CLAUDE_INPUT_TOKENS=" + ((.input_tokens // "") | tostring),
+                 "CLAUDE_OUTPUT_TOKENS=" + ((.output_tokens // "") | tostring),
+                 "CLAUDE_CACHE_READ_TOKENS=" + ((.cache_read_tokens // "") | tostring),
+                 "CLAUDE_CACHE_CREATION_TOKENS=" + ((.cache_creation_tokens // "") | tostring),
+                 "CLAUDE_NUM_TURNS=" + ((.num_turns // "") | tostring),
+                 "CLAUDE_DURATION_MS=" + ((.duration_ms // "") | tostring)' \
+            "${RUNNER_TEMP}/claude-usage.json" >> "$GITHUB_ENV"
+
+          result=$(grep -m1 '^RESULT:' "$result_text" | sed 's/^RESULT: *//') || true
+
+          if [ -z "$result" ]; then
+            echo "::error::claude's output has no RESULT: line"
+            {
+              echo "claude's output has no RESULT: line — cannot determine outcome."
+              echo
+              tail -c 2000 "$result_text"
+            } > "${RUNNER_TEMP}/failure-reason.txt"
+            exit 1
+          fi
+
+          echo "result=${result}" >> "$GITHUB_OUTPUT"
+
+      - name: Route needs-changes — apply-review or cap out
+        if: steps.agent.outputs.result == 'needs-changes'
+        env:
+          CLICKUP_API_TOKEN: ${{ secrets.CLICKUP_API_TOKEN }}
+          DISPATCH_PAT: ${{ secrets.DISPATCH_PAT }}
+        run: |
+          set -uo pipefail
+
+          # Same commit-counting cap pattern agent-react-to-e2e.yml already uses for its
+          # own retry loop (MAX_E2E_RETRIES via a fixed commit-message prefix) — see
+          # header comment. "Address review feedback: <ticket>" is agent-implement.yml's
+          # own existing apply-review commit prefix; the exact wording is load-bearing
+          # here too, not cosmetic.
+          count=$(git log --oneline | grep -c "Address review feedback: ${TICKET_ID}" || true)
+
+          if [ "$count" -ge "$MAX_APPLY_REVIEW_ROUNDS" ]; then
+            curl -sS -o /dev/null -w 'tag needs-human: %{http_code}\n' \
+              -X POST \
+              -H "Authorization: ${CLICKUP_API_TOKEN}" \
+              "https://api.clickup.com/api/v2/task/${TICKET_ID}/tag/needs-human" || true
+
+            comment_text=$(printf 'Merge triage still found actionable review feedback after %s apply-review round(s) (cap: %s) — stopping instead of looping. Reasoning below.\n\n%s' \
+              "$count" "$MAX_APPLY_REVIEW_ROUNDS" "$(tail -c 3000 "${RUNNER_TEMP}/claude-output.txt")")
+            comment_blocks=$(printf '%s' "$comment_text" | node .github/scripts/markdown-to-clickup-comment.mjs)
+            comment_payload=$(jq -n --argjson c "$comment_blocks" '{comment: $c, notify_all: false}')
+            curl -sS -o /dev/null -w 'comment: %{http_code}\n' \
+              -X POST \
+              -H "Authorization: ${CLICKUP_API_TOKEN}" \
+              -H "Content-Type: application/json" \
+              "https://api.clickup.com/api/v2/task/${TICKET_ID}/comment" \
+              -d "$comment_payload" || true
+
+            echo "Ticket ${TICKET_ID}: apply-review rounds exhausted (${count}/${MAX_APPLY_REVIEW_ROUNDS}) — tagged needs-human, not dispatching again."
+            {
+              echo "OUTCOME=failed"
+              echo "FAILURE_CLASS=apply-review-rounds-exhausted"
+              echo "CLICKUP_STATUS_AFTER=in review"
+            } >> "$GITHUB_ENV"
+            exit 0
+          fi
+
+          payload=$(jq -n --arg ticket_id "$TICKET_ID" \
+            --arg caused_by_run_id "${{ github.run_id }}-${{ github.run_attempt }}" \
+            '{event_type: "clickup-apply-review", client_payload: {ticket_id: $ticket_id, caused_by_run_id: $caused_by_run_id, triggered_by: "poller"}}')
+
+          http_code=$(curl -sS -o "${RUNNER_TEMP}/dispatch-response.json" -w '%{http_code}' \
+            -X POST \
+            -H "Authorization: Bearer ${DISPATCH_PAT}" \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "https://api.github.com/repos/${{ github.repository }}/dispatches" \
+            -d "$payload")
+
+          if [ "$http_code" -lt 200 ] || [ "$http_code" -ge 300 ]; then
+            echo "::error::GitHub dispatch API returned HTTP ${http_code}"
+            cat "${RUNNER_TEMP}/dispatch-response.json"
+            {
+              echo "GitHub dispatch API (clickup-apply-review) returned HTTP ${http_code}."
+              echo
+              cat "${RUNNER_TEMP}/dispatch-response.json"
+            } > "${RUNNER_TEMP}/failure-reason.txt"
+            exit 1
+          fi
+
+          echo "Ticket ${TICKET_ID}: triage found actionable feedback (round $((count + 1))/${MAX_APPLY_REVIEW_ROUNDS}) — dispatched clickup-apply-review."
+          {
+            echo "OUTCOME=routed-to-apply-review"
+            echo "CLICKUP_STATUS_AFTER=in review"
+          } >> "$GITHUB_ENV"
+
+      - name: Route ready-to-merge — archive and merge
+        if: steps.agent.outputs.result == 'ready-to-merge'
+        env:
+          CLICKUP_API_TOKEN: ${{ secrets.CLICKUP_API_TOKEN }}
+          GH_TOKEN: ${{ secrets.DISPATCH_PAT }}
+        run: |
+          set -euo pipefail
+
+          run_step() {
+            local label="$1"
+            shift
+            local output code
+            output=$("$@" 2>&1) && code=0 || code=$?
+            if [ "$code" -ne 0 ]; then
+              echo "$output"
+              {
+                echo "${label} failed:"
+                echo
+                echo "$output"
+              } > "${RUNNER_TEMP}/failure-reason.txt"
+              exit "$code"
+            fi
+            echo "$output"
+          }
+
+          run_step "openspec archive" openspec archive "$SPEC_ID" --yes --json
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          run_step "git add" git add -A
+          run_step "git commit" git commit -m "Archive OpenSpec change: ${TICKET_ID}"
+          run_step "git push" git push origin "poc/${TICKET_ID}"
+
+          echo "COMMIT_SHA=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+
+          pr_url=$(gh pr view "poc/${TICKET_ID}" --json url -q .url -R "${{ github.repository }}")
+
+          run_step "gh pr merge" gh pr merge "poc/${TICKET_ID}" \
+            --merge --delete-branch -R "${{ github.repository }}"
+
+          status_payload=$(jq -n '{status: "ready for deploy"}')
+          http_code=$(curl -sS -o "${RUNNER_TEMP}/merge-status-response.json" -w '%{http_code}' \
+            -X PUT \
+            -H "Authorization: ${CLICKUP_API_TOKEN}" \
+            -H "Content-Type: application/json" \
+            "https://api.clickup.com/api/v2/task/${TICKET_ID}" \
+            -d "$status_payload")
+
+          if [ "$http_code" -lt 200 ] || [ "$http_code" -ge 300 ]; then
+            echo "::error::ClickUp PUT status (ready for deploy) returned HTTP ${http_code}"
+            cat "${RUNNER_TEMP}/merge-status-response.json"
+            {
+              echo "ClickUp PUT status (ready for deploy) returned HTTP ${http_code}."
+              echo
+              cat "${RUNNER_TEMP}/merge-status-response.json"
+            } > "${RUNNER_TEMP}/failure-reason.txt"
+            exit 1
+          fi
+
+          comment_text=$(printf 'Archived OpenSpec change %s and merged the PR into develop.\n\n%s' \
+            "\`${SPEC_ID}\`" "$pr_url")
+          comment_blocks=$(printf '%s' "$comment_text" | node .github/scripts/markdown-to-clickup-comment.mjs)
+          comment_payload=$(jq -n --argjson c "$comment_blocks" '{comment: $c, notify_all: false}')
+          curl -sS -o /dev/null -w 'comment: %{http_code}\n' \
+            -X POST \
+            -H "Authorization: ${CLICKUP_API_TOKEN}" \
+            -H "Content-Type: application/json" \
+            "https://api.clickup.com/api/v2/task/${TICKET_ID}/comment" \
+            -d "$comment_payload" || true
+
+          echo "Ticket ${TICKET_ID}: archived and merged — moved to \"ready for deploy\"."
+          {
+            echo "OUTCOME=merged"
+            echo "CLICKUP_STATUS_AFTER=ready for deploy"
+          } >> "$GITHUB_ENV"
+
+      - name: On failure after the lock, flag for a human
+        if: failure() && steps.lock.outcome == 'success'
+        continue-on-error: true
+        env:
+          CLICKUP_API_TOKEN: ${{ secrets.CLICKUP_API_TOKEN }}
+        run: |
+          run_url="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          reason_file="${RUNNER_TEMP}/failure-reason.txt"
+
+          if [ -f "$reason_file" ]; then
+            reason=$(head -c 2500 "$reason_file")
+          else
+            reason="(no specific reason was captured for this failure — check the run log)"
+          fi
+
+          curl -sS -o /dev/null -w 'tag: %{http_code}\n' \
+            -X POST \
+            -H "Authorization: ${CLICKUP_API_TOKEN}" \
+            "https://api.clickup.com/api/v2/task/${TICKET_ID}/tag/needs-human" || true
+
+          comment_text=$(printf 'Automated merge triage/archive failed.\n\n%s\n\nRun: %s' "$reason" "$run_url")
+
+          comment_payload=$(jq -n --arg t "$comment_text" '{comment_text: $t, notify_all: false}')
+          curl -sS -o /dev/null -w 'comment: %{http_code}\n' \
+            -X POST \
+            -H "Authorization: ${CLICKUP_API_TOKEN}" \
+            -H "Content-Type: application/json" \
+            "https://api.clickup.com/api/v2/task/${TICKET_ID}/comment" \
+            -d "$comment_payload" || true
+
+      - name: Emit run record
+        if: always()
+        continue-on-error: true
+        run: |
+          set -uo pipefail
+
+          outcome="${OUTCOME:-}"
+          if [ -z "$outcome" ]; then
+            case "${{ job.status }}" in
+              success) outcome="success" ;;
+              cancelled) outcome="cancelled" ;;
+              *) outcome="failed" ;;
+            esac
+          fi
+
+          RUN_ID="${{ github.run_id }}-${{ github.run_attempt }}" \
+          RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+          WORKFLOW="agent-merge" \
+          EVENT_TYPE="${{ github.event.action || 'workflow_dispatch' }}" \
+          TICKET_ID="${TICKET_ID}" \
+          TICKET_TITLE="${TICKET_TITLE:-}" \
+          SPEC_ID="${SPEC_ID:-}" \
+          COMMIT_SHA="${COMMIT_SHA:-}" \
+          CAUSED_BY_RUN_ID="${CAUSED_BY_RUN_ID:-}" \
+          TRIGGERED_BY="${TRIGGERED_BY:-manual}" \
+          STARTED_AT="${STARTED_AT:-}" \
+          FINISHED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+          OUTCOME="$outcome" \
+          FAILURE_CLASS="${FAILURE_CLASS:-}" \
+          CLICKUP_STATUS_BEFORE="in review" \
+          CLICKUP_STATUS_AFTER="${CLICKUP_STATUS_AFTER:-}" \
+          CLAUDE_SESSION_ID="${CLAUDE_SESSION_ID:-}" \
+          CLAUDE_MODEL_USED="${CLAUDE_MODEL_USED:-}" \
+          CLAUDE_COST_USD="${CLAUDE_COST_USD:-}" \
+          CLAUDE_INPUT_TOKENS="${CLAUDE_INPUT_TOKENS:-}" \
+          CLAUDE_OUTPUT_TOKENS="${CLAUDE_OUTPUT_TOKENS:-}" \
+          CLAUDE_CACHE_READ_TOKENS="${CLAUDE_CACHE_READ_TOKENS:-}" \
+          CLAUDE_CACHE_CREATION_TOKENS="${CLAUDE_CACHE_CREATION_TOKENS:-}" \
+          CLAUDE_NUM_TURNS="${CLAUDE_NUM_TURNS:-}" \
+          CLAUDE_DURATION_MS="${CLAUDE_DURATION_MS:-}" \
+            node "${RUNNER_TEMP}/record-run.mjs" > "${RUNNER_TEMP}/run-record.json"
+
+          cat "${RUNNER_TEMP}/run-record.json"
+
+      - name: Upload run record
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: run-record-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/run-record.json
+          retention-days: 90
