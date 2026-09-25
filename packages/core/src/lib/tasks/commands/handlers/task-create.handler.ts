@@ -59,6 +59,13 @@ export class TaskCreateHandler implements ICommandHandler<TaskCreateCommand> {
 			// Retrieve current user from the request context
 			const user = RequestContext.currentUser();
 
+			// When the requester is a plain Employee (not an Admin/Manager acting on someone
+			// else's behalf), default-assign them to their own task unless already included.
+			const currentEmployeeId = RequestContext.currentEmployeeId();
+			if (currentEmployeeId && !members.some(({ id }) => id === currentEmployeeId)) {
+				members.push(new Employee({ id: currentEmployeeId }));
+			}
+
 			// Determine the project based on the provided data
 			const project = data.projectId
 				? await this._organizationProjectService.findOneByIdString(data.projectId)

@@ -6,7 +6,13 @@
 @if (total > 0) {
 	<div class="people" [class.is-wrapped]="wrap">
 		@for (person of named; track person.key) {
-			<a class="person" [class.is-link]="!!person.id" [nbTooltip]="person.name" (click)="onSelect(person)">
+			<a
+				class="person"
+				[class.is-link]="!!person.id"
+				[nbTooltip]="person.name"
+				[attr.data-testid]="'task-member-' + person.id"
+				(click)="onSelect(person)"
+			>
 				<span class="person-avatar">
 					@if (person.imageUrl) {
 						<img [src]="person.imageUrl" [alt]="person.name" (error)="onImageError(person)" />
@@ -24,6 +30,7 @@
 						class="person-avatar is-stacked"
 						[class.is-link]="!!person.id"
 						[nbTooltip]="person.name"
+						[attr.data-testid]="'task-member-' + person.id"
 						(click)="onSelect(person)"
 					>
 						@if (person.imageUrl) {
