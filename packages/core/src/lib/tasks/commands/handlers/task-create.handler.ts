@@ -79,10 +79,17 @@ export class TaskCreateHandler implements ICommandHandler<TaskCreateCommand> {
 				projectId: project?.id ?? null // If no project is provided, this will pass null for projectId
 			});
 
+			// Always include the requesting user's own employee among the task's members,
+			// deduplicated against any members already present in the request.
+			const memberIds = new Set(members.map(({ id }) => id));
+			if (user?.employeeId) {
+				memberIds.add(user.employeeId);
+			}
+
 			// Create the task with incremented number, project prefix, and other task details
 			const task = await this._taskService.create({
 				...data, // Spread the input properties
-				members: members.map(({ id }) => new Employee({ id })),
+				members: Array.from(memberIds).map((id) => new Employee({ id })),
 				number: maxNumber + 1, // Increment the task number
 				prefix: projectPrefix, // Use the project prefix, or null if no project
 				tenantId, // Pass the tenant ID
