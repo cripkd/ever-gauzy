@@ -5,6 +5,19 @@ paths:
 
 # Writing a Playwright spec
 
+## This app uses hash-based routing
+
+`page.goto('/pages/tasks/dashboard')` — a path with no `#` — is not a
+route in this app at all. Confirmed by reproducing it locally: the app
+runs Angular's `HashLocationStrategy`, so every real in-app URL looks
+like `/#/pages/tasks/dashboard`. A `page.goto()` to a path missing the
+`#` doesn't error; it silently falls through to whatever the app's
+default route is (observed: redirected to Time Tracking) and the test
+only fails much later, waiting on an element that was never going to
+appear on that page. Always include the `#` when constructing a
+`page.goto()` target: `page.goto('/#/pages/tasks/dashboard')`, not
+`page.goto('/pages/tasks/dashboard')`.
+
 ## Assert you've landed where you meant to
 
 After every `page.goto()` or in-app navigation, assert you've actually
