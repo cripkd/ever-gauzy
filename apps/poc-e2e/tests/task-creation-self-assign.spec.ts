@@ -47,7 +47,7 @@ test('creating a task from the Tasks page renders a member chip for the logged-i
 
 	await expect(page.getByTestId('dashboard-container')).toBeVisible({ timeout: 60_000 });
 
-	await page.goto('/pages/tasks/dashboard');
+	await page.goto('/#/pages/tasks/dashboard');
 	await expect(page.getByTestId('add-task-trigger')).toBeVisible({ timeout: 60_000 });
 
 	await page.getByTestId('add-task-trigger').click();
