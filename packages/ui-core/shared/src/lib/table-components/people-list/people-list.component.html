@@ -10,7 +10,7 @@
 				class="person"
 				[class.is-link]="!!person.id"
 				[nbTooltip]="person.name"
-				[attr.data-testid]="'task-member-' + person.id"
+				[attr.data-testid]="person.id ? 'person-chip-' + person.id : null"
 				(click)="onSelect(person)"
 			>
 				<span class="person-avatar">
@@ -30,7 +30,7 @@
 						class="person-avatar is-stacked"
 						[class.is-link]="!!person.id"
 						[nbTooltip]="person.name"
-						[attr.data-testid]="'task-member-' + person.id"
+						[attr.data-testid]="person.id ? 'person-chip-' + person.id : null"
 						(click)="onSelect(person)"
 					>
 						@if (person.imageUrl) {

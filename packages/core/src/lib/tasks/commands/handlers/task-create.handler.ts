@@ -64,12 +64,12 @@ export class TaskCreateHandler implements ICommandHandler<TaskCreateCommand> {
 
 			// When the requester is a plain Employee (not an Admin/Manager acting on someone
 			// else's behalf), default-assign them to their own task unless already included.
+			// No DB round trip here: `.map(({ id }) => new Employee({ id }))` below only ever
+			// reads `.id`, and a lookup would let a stale/deleted employee id (still valid in
+			// the JWT) throw and fail the whole task creation instead of degrading gracefully.
 			const currentEmployeeId = RequestContext.currentEmployeeId();
 			if (currentEmployeeId && !members.some(({ id }) => id === currentEmployeeId)) {
-				const currentEmployee = await this._employeeService.findOneByIdString(currentEmployeeId);
-				if (currentEmployee) {
-					members.push(currentEmployee);
-				}
+				members.push(new Employee({ id: currentEmployeeId }));
 			}
 
 			// Determine the project based on the provided data

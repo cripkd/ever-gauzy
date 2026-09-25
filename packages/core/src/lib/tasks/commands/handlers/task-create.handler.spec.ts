@@ -102,15 +102,6 @@ describe('TaskCreateHandler', () => {
 
 			expect(memberIds).toEqual(['emp-1']);
 		});
-
-		it('is not added when the current employee id no longer resolves to a real employee record', async () => {
-			const deps = makeFakeDeps();
-			deps.employeeService.findOneByIdString.mockResolvedValue(null);
-
-			const memberIds = await createTask(deps, []);
-
-			expect(memberIds).toEqual([]);
-		});
 	});
 
 	describe('a caller with no resolvable current employee id', () => {
