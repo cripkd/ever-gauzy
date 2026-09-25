@@ -1,22 +1,29 @@
 name: Agent React to E2E
 
-# Fires once per completed poc-e2e.yml run and closes the loop that was missing before
-# this workflow existed: agent-implement.yml used to mark a PR ready for review as soon
-# as its own self-check (lint/typecheck/build) passed — before the real e2e suite, which
-# runs separately and asynchronously on the push, had even finished. Confirmed live on
-# ticket 869f5qg9d: a WIP push there triggered poc-e2e.yml automatically and came back
-# red, and nothing downstream ever noticed.
+# Fires once per poc-e2e.yml completion (on a ticket branch) and closes the loop that was
+# missing before this workflow existed: agent-implement.yml used to mark a PR ready for
+# review as soon as its own self-check (lint/typecheck/build) passed — before the real
+# e2e suite, which runs separately and asynchronously on the push, had even finished.
+# Confirmed live on ticket 869f5qg9d: a WIP push there triggered poc-e2e.yml automatically
+# and came back red, and nothing downstream ever noticed.
 #
-# poc-e2e.yml itself stays completely ticket-agnostic — it has no idea what triggered it
-# or why. This workflow is the bridge: workflow_run fires regardless of which branch
-# triggered the target workflow, and every ticket branch is deterministically
-# poc/<ticket_id>, so the correlation is a plain string match on the branch name, nothing
-# poc-e2e.yml needs to know about.
+# Triggered by a direct repository_dispatch from poc-e2e.yml's own last step, not GitHub's
+# workflow_run event — deliberately. workflow_run was the original design and looked
+# right on paper (poc-e2e.yml stays completely ticket-agnostic; workflow_run fires
+# regardless of which branch triggered the target workflow). In practice, confirmed
+# empirically across 15 real completions over 3 days: workflow_run fired exactly 3
+# times, and all 3 were the very first e2e check on a freshly-opened PR (propose's own
+# push) — it never once fired for a subsequent push to an existing PR, success or
+# failure, the actual common case this workflow exists for. Likely related to
+# poc-e2e.yml's own `concurrency: cancel-in-progress: true` reusing a check suite across
+# a PR's life rather than getting a fresh one each push, though the exact GitHub-internal
+# mechanism was never confirmed — the empirical pattern alone was reason enough to stop
+# depending on it. Direct dispatch sidesteps the whole question.
 #
 # Flow:
-#   1. Job-level `if:` — branch must look like poc/<ticket_id>, or skip the whole job.
-#      Not every PR in this repo is a ticket branch (e.g. one opened directly against
-#      develop).
+#   1. Every field this job needs (ticket_id already stripped of "poc/", head_sha,
+#      conclusion, run_id/run_attempt/run_url) arrives directly in client_payload — no
+#      guessing from a branch name or GitHub's own event shape.
 #   2. Two guards, both in one step, each exiting quietly (not as a failure) rather than
 #      acting on an e2e run this workflow has no business touching:
 #        - Status must be "in progress". Confirmed necessary, not defensive-coding
@@ -61,15 +68,14 @@ name: Agent React to E2E
 # accepted gap, not one fixed silently later without anyone noticing it was ever there.
 
 on:
-  workflow_run:
-    workflows: ['POC E2E']
-    types: [completed]
+  repository_dispatch:
+    types: [poc-e2e-result]
 
-# Only ever act on runs against a ticket branch. Everything else (e.g. a PR opened
-# straight against develop) is none of this workflow's business.
+# poc-e2e.yml only ever sends this dispatch when it resolved a ticket_id (a poc/<ticket>
+# branch) in the first place — see its own "Dispatch e2e result" step — so every event
+# this workflow receives is already ticket-scoped; no branch-name guard needed here.
 jobs:
   react:
-    if: startsWith(github.event.workflow_run.head_branch, 'poc/')
     name: React to e2e result
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -77,7 +83,7 @@ jobs:
       # Two e2e completions close together (e.g. a stale run finishing just after a
       # fresher one) would otherwise race two instances of this job against the same
       # ticket and could double-dispatch a retry.
-      group: agent-react-to-e2e-${{ github.event.workflow_run.head_branch }}
+      group: agent-react-to-e2e-${{ github.event.client_payload.ticket_id }}
       cancel-in-progress: false
     permissions:
       # Read-only: this job never pushes (contents: read, via the default, is enough for
@@ -86,7 +92,7 @@ jobs:
       contents: read
       actions: read
     env:
-      TICKET_ID: ${{ github.event.workflow_run.head_branch }}
+      TICKET_ID: ${{ github.event.client_payload.ticket_id }}
       # Each cycle costs a full CI bring-up plus a real Claude invocation — genuinely
       # non-trivial. Three gives room for "try, learn from a real failure, try again,
       # learn again, try a third informed time," the same number of honest attempts a
@@ -94,24 +100,22 @@ jobs:
       # that's fundamentally stuck.
       MAX_E2E_RETRIES: 3
       # This run's own "cause," for its own run-record (see docs/dashboard-plan.md) —
-      # not a client_payload field like every other agent's, since this workflow is
-      # triggered by workflow_run completing, not a dispatch. TRIGGERED_BY is a value
-      # none of the other agents use ("poller"/"reactor"/"manual"), since this
-      # workflow's own trigger mechanism genuinely is a fourth, distinct thing.
-      CAUSED_BY_RUN_ID: ${{ github.event.workflow_run.id }}-${{ github.event.workflow_run.run_attempt }}
+      # a client_payload field now, same as every other agent, since this workflow is
+      # itself dispatched like the rest of the pipeline. TRIGGERED_BY is still a value
+      # none of the other agents use ("poller"/"reactor"/"manual"), since e2e completing
+      # is genuinely a fourth, distinct kind of trigger.
+      CAUSED_BY_RUN_ID: ${{ github.event.client_payload.run_id }}-${{ github.event.client_payload.run_attempt }}
       TRIGGERED_BY: poc-e2e
     steps:
-      - name: Strip the poc/ prefix
-        run: |
-          echo "STARTED_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_ENV"
-          echo "TICKET_ID=${TICKET_ID#poc/}" >> "$GITHUB_ENV"
+      - name: Capture start time
+        run: echo "STARTED_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_ENV"
 
       - name: Guards — in progress, not stale
         id: guard
         env:
           CLICKUP_API_TOKEN: ${{ secrets.CLICKUP_API_TOKEN }}
           GH_TOKEN: ${{ secrets.DISPATCH_PAT }}
-          RUN_HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+          RUN_HEAD_SHA: ${{ github.event.client_payload.head_sha }}
         run: |
           set -euo pipefail
 
@@ -183,7 +187,7 @@ jobs:
         run: cp .github/scripts/record-run.mjs "${RUNNER_TEMP}/record-run.mjs"
 
       - name: On green — mark ready for review
-        if: steps.guard.outputs.proceed == 'true' && github.event.workflow_run.conclusion == 'success'
+        if: steps.guard.outputs.proceed == 'true' && github.event.client_payload.conclusion == 'success'
         env:
           CLICKUP_API_TOKEN: ${{ secrets.CLICKUP_API_TOKEN }}
           # DISPATCH_PAT, not GITHUB_TOKEN — same reasoning as every other gh pr call in
@@ -209,7 +213,7 @@ jobs:
 
           gh pr ready "poc/${TICKET_ID}" -R "${{ github.repository }}"
 
-          run_url="${{ github.event.workflow_run.html_url }}"
+          run_url="${{ github.event.client_payload.run_url }}"
           comment_text=$(printf 'e2e passed — PR marked ready for review.\n\nRun: %s' "$run_url")
           comment_payload=$(jq -n --arg t "$comment_text" '{comment_text: $t, notify_all: false}')
           curl -sS -o /dev/null -w 'comment: %{http_code}\n' \
@@ -226,26 +230,26 @@ jobs:
           } >> "$GITHUB_ENV"
 
       - name: Check out the ticket branch (failure path only)
-        if: steps.guard.outputs.proceed == 'true' && github.event.workflow_run.conclusion == 'failure'
+        if: steps.guard.outputs.proceed == 'true' && github.event.client_payload.conclusion == 'failure'
         uses: actions/checkout@v5
         with:
           fetch-depth: 0
 
       - name: Switch to the ticket branch
-        if: steps.guard.outputs.proceed == 'true' && github.event.workflow_run.conclusion == 'failure'
+        if: steps.guard.outputs.proceed == 'true' && github.event.client_payload.conclusion == 'failure'
         run: |
           set -euo pipefail
           git fetch origin "poc/${TICKET_ID}"
           git checkout -B "poc/${TICKET_ID}" "origin/poc/${TICKET_ID}"
 
       - name: On red — count retries, then cap or dispatch a fix
-        if: steps.guard.outputs.proceed == 'true' && github.event.workflow_run.conclusion == 'failure'
+        if: steps.guard.outputs.proceed == 'true' && github.event.client_payload.conclusion == 'failure'
         env:
           CLICKUP_API_TOKEN: ${{ secrets.CLICKUP_API_TOKEN }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           DISPATCH_PAT: ${{ secrets.DISPATCH_PAT }}
-          RUN_URL: ${{ github.event.workflow_run.html_url }}
-          RUN_ID: ${{ github.event.workflow_run.id }}
+          RUN_URL: ${{ github.event.client_payload.run_url }}
+          RUN_ID: ${{ github.event.client_payload.run_id }}
         run: |
           set -euo pipefail
 
@@ -433,7 +437,7 @@ jobs:
           RUN_ID="${{ github.run_id }}-${{ github.run_attempt }}" \
           RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
           WORKFLOW="agent-react-to-e2e" \
-          EVENT_TYPE="workflow_run" \
+          EVENT_TYPE="poc-e2e-result" \
           TICKET_ID="${TICKET_ID}" \
           TICKET_TITLE="${TICKET_TITLE:-}" \
           CAUSED_BY_RUN_ID="${CAUSED_BY_RUN_ID:-}" \
