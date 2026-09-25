@@ -42,6 +42,20 @@ Change id: `.change-name` in the repo root. Ticket context (supplementary
      surrounding code rather than introducing new patterns. Mark it
      `- [x]` only once its specified behaviour is fully implemented — not
      for partial or deferred work.
+
+     Writing a Playwright spec (task 1, always) is a code task like any
+     other, with one standing rule beyond matching existing test
+     conventions: after every `page.goto()` or in-app navigation, assert
+     you've actually landed where you meant to — a heading, breadcrumb, or
+     route-specific element — *before* interacting with anything on that
+     page. Playwright's own locator actions already wait for an element to
+     become actionable; that's not what a silent misnavigation needs. A
+     test that jumps straight to `page.locator(...).click()` after
+     navigating will, if the app lands somewhere else, fail 30 seconds
+     later on an unrelated element that was simply never going to appear —
+     an opaque "button never appeared" instead of an immediate, legible
+     "never reached this page." Fail at the navigation, not at whatever
+     happens to time out next.
    - **Verification-only task** — its entire instruction is to run an
      existing command or suite and check whether it passes ("run the spec
      from task 1.1 and verify it's green", "run lint/typecheck/build and
