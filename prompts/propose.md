@@ -8,12 +8,27 @@ Ticket: `ticket.md` in the repo root.
 ## Steps
 
 1. Read `ticket.md`.
-2. Explore the codebase enough to identify which capability this
-   touches and where the relevant code lives. Read only. Find every
-   caller/entry point of the affected function, command, or handler —
-   not just the one path the ticket's reproduction steps happened to
-   describe. A bug report shows *a* way to trigger the bug, never a
-   guarantee that it's the only one.
+2. Check whether this ticket touches a capability that already has an
+   archived spec — bounded to three cheap steps regardless of how many
+   specs the project has accumulated, never a read-everything scan:
+   a. `openspec list --specs --json` — just capability ids and
+      requirement counts, trivial cost even at dozens of specs.
+   b. For any id that's a plausible name match to this ticket's subject,
+      check *only* that spec's `## Purpose` line
+      (`openspec/specs/<id>/spec.md`) to confirm relevance — not the
+      rest of the file.
+   c. Read the full spec only for the id(s) confirmed relevant in (b).
+   If a relevant spec exists, this is a **Modified Capability**, not a
+   New one — read it as ground truth for current behavior; step 3's
+   exploration is then about what's actually changing relative to it,
+   not rediscovering the capability from scratch. If nothing plausibly
+   matches, proceed as normal.
+3. Explore the codebase enough to identify which capability this
+   touches (if step 2 didn't already answer that) and where the
+   relevant code lives. Read only. Find every caller/entry point of the
+   affected function, command, or handler — not just the one path the
+   ticket's reproduction steps happened to describe. A bug report shows
+   *a* way to trigger the bug, never a guarantee that it's the only one.
 
    - **Don't**: a ticket reproduces a bug through one UI dialog: explore
      only that dialog's component, propose a fix scoped to it.
@@ -23,10 +38,10 @@ Ticket: `ticket.md` in the repo root.
      actually covers. A backend-level fix that covers every caller is
      usually more robust than a frontend-level one that covers only the
      dialog the reporter happened to use.
-3. Run the OpenSpec propose workflow to create a change under
+4. Run the OpenSpec propose workflow to create a change under
    `openspec/changes/`, with proposal, spec delta, and tasks.
-4. Run `openspec validate --strict` and fix anything it reports.
-5. Stop. Do not commit, push, or open a PR — the workflow does that.
+5. Run `openspec validate --strict` and fix anything it reports.
+6. Stop. Do not commit, push, or open a PR — the workflow does that.
 
 ## Constraints
 
