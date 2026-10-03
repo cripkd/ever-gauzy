@@ -1,5 +1,29 @@
 // scripts/lib/clickup.mjs
+import { spawn } from 'node:child_process';
+
 const BASE = 'https://api.clickup.com/api/v2';
+
+// Shells out to the existing .github/scripts/markdown-to-clickup-comment.mjs, piping
+// markdown in via stdin and parsing the block-array JSON it writes to stdout — same
+// contract the original bash uses (`printf '%s' "$text" | node .github/scripts/...`).
+// Exported (not just used internally) so its conversion logic is unit-testable without
+// a network call.
+export function markdownToBlocks(markdown) {
+  return new Promise((resolve, reject) => {
+    const child = spawn('node', ['.github/scripts/markdown-to-clickup-comment.mjs']);
+    let stdout = '';
+    let stderr = '';
+    child.stdout.on('data', (d) => { stdout += d; });
+    child.stderr.on('data', (d) => { stderr += d; });
+    child.on('error', reject);
+    child.on('close', (code) => {
+      if (code !== 0) reject(new Error(`markdown-to-clickup-comment.mjs exited ${code}: ${stderr}`));
+      else resolve(JSON.parse(stdout));
+    });
+    child.stdin.write(markdown);
+    child.stdin.end();
+  });
+}
 
 function token() {
   const t = process.env.CLICKUP_API_TOKEN;
@@ -54,6 +78,15 @@ export async function postPlainComment(ticketId, text) {
   if (!res.ok) {
     const body = await res.text();
     throw new Error(`ClickUp POST comment returned HTTP ${res.status}: ${body}`);
+  }
+}
+
+export async function postMarkdownComment(ticketId, markdownText) {
+  const blocks = await markdownToBlocks(markdownText);
+  const res = await request('POST', `/task/${ticketId}/comment`, { comment: blocks, notify_all: false });
+  if (!res.ok) {
+    const body = await res.text();
+    throw new Error(`ClickUp POST comment (markdown) returned HTTP ${res.status}: ${body}`);
   }
 }
 
