@@ -34,8 +34,15 @@ const task = await getTask(ticketId);
 assertStatus(task, 'spec proposed');
 writeFileSync('ticket.md', task.description ?? '');
 
+// Overridable for the same reason as review.mjs/implement.mjs — lower risk here since
+// agent-propose.yml creates poc/<ticket_id> fresh from develop's current tip right
+// before this point, but a caller invoking this script some time after that branch
+// creation (e.g. a retried run) should still have the option to pin a stable copy.
+const PROPOSE_PROMPT_PATH = process.env.PROPOSE_PROMPT_PATH || 'prompts/propose.md';
+const PROPOSE_CRITIQUE_PROMPT_PATH = process.env.PROPOSE_CRITIQUE_PROMPT_PATH || 'prompts/propose-critique.md';
+
 const proposeResult = await runClaude({
-  promptPath: 'prompts/propose.md',
+  promptPath: PROPOSE_PROMPT_PATH,
   allowedTools: ALLOWED_TOOLS,
   model: CLAUDE_MODEL,
   cwd: '.',
@@ -50,7 +57,7 @@ if (result === 'proposed') {
   // prompts/propose-critique.md's own header for why. Only meaningful against a real
   // proposal, matching agent-propose.yml:404's `if: steps.agent.outputs.result == 'proposed'`.
   const critiqueResult = await runClaude({
-    promptPath: 'prompts/propose-critique.md',
+    promptPath: PROPOSE_CRITIQUE_PROMPT_PATH,
     allowedTools: ALLOWED_TOOLS,
     model: CLAUDE_MODEL,
     cwd: '.',

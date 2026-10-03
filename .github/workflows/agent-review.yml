@@ -89,51 +89,26 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      - name: Move task to in review, remove for-ai (dispatch lock)
-        id: lock
-        env:
-          CLICKUP_API_TOKEN: ${{ secrets.CLICKUP_API_TOKEN }}
-        run: |
-          # Captured unconditionally, before `set -euo pipefail` even engages, so a
-          # failure anywhere in this step (including the lock itself) still leaves a
-          # start time for the run-record emit step at the end of the job to use.
-          echo "STARTED_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_ENV"
-
-          set -euo pipefail
-
-          payload=$(jq -n '{status: "in review"}')
-
-          http_code=$(curl -sS -o "${RUNNER_TEMP}/lock-response.json" -w '%{http_code}' \
-            -X PUT \
-            -H "Authorization: ${CLICKUP_API_TOKEN}" \
-            -H "Content-Type: application/json" \
-            "https://api.clickup.com/api/v2/task/${TICKET_ID}" \
-            -d "$payload")
-
-          if [ "$http_code" -lt 200 ] || [ "$http_code" -ge 300 ]; then
-            echo "::error::ClickUp PUT status returned HTTP ${http_code} — could not acquire the dispatch lock, stopping."
-            cat "${RUNNER_TEMP}/lock-response.json"
-            exit 1
-          fi
-
-          echo "Ticket ${TICKET_ID}: moved to \"in review\"."
-
-          # Consumes the tag now that this gate is passed — every agent's own lock does
-          # this (see header comment); "for-ai" gates each stage's dispatch
-          # independently, so it must be re-added deliberately for the next stage (or a
-          # future apply-fix step) to run automatically too. Best effort, not gated on
-          # http_code the way the status PUT above is: the lock itself already succeeded
-          # by this point.
-          tag_remove_code=$(curl -sS -o /dev/null -w '%{http_code}' \
-            -X DELETE \
-            -H "Authorization: ${CLICKUP_API_TOKEN}" \
-            "https://api.clickup.com/api/v2/task/${TICKET_ID}/tag/for-ai" || true)
-          echo "Ticket ${TICKET_ID}: removed \"for-ai\" tag (HTTP ${tag_remove_code})."
+      - name: Capture start time
+        run: echo "STARTED_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_ENV"
 
       - name: Checkout
         uses: actions/checkout@v5
         with:
           fetch-depth: 0
+
+      - name: Move task to in review, remove for-ai (dispatch lock)
+        id: lock
+        # Runs on the just-checked-out default branch, BEFORE the ticket-branch switch
+        # below — deliberately. The lock needs only the ClickUp API, no git state at
+        # all, which is exactly why it must happen before a branch switch that might
+        # fail: if it failed AFTER the lock, the ticket is already out of the poller's
+        # dispatch window and falls through to the generic "flag for human" step
+        # instead of being silently re-dispatched into the same failure forever. See
+        # scripts/lock-ticket.mjs's own header comment.
+        env:
+          CLICKUP_API_TOKEN: ${{ secrets.CLICKUP_API_TOKEN }}
+        run: node scripts/lock-ticket.mjs "$TICKET_ID" "in review"
 
       - name: Capture the review prompt and record-run.mjs
         # Must happen BEFORE the branch switch below, and land outside the repo checkout
@@ -160,63 +135,6 @@ jobs:
           fi
 
           git checkout -B "$branch" "origin/$branch"
-
-      - name: Resolve the OpenSpec change
-        run: |
-          set -euo pipefail
-
-          change_dir=$(find openspec/changes -mindepth 1 -maxdepth 1 -type d ! -name archive 2>/dev/null || true)
-          count=$(echo "$change_dir" | grep -c . || true)
-
-          if [ "$count" -ne 1 ]; then
-            reason="Expected exactly one active OpenSpec change on poc/${TICKET_ID}, found ${count}:
-          ${change_dir}"
-            echo "::error::${reason}"
-            echo "$reason" > "${RUNNER_TEMP}/failure-reason.txt"
-            exit 1
-          fi
-
-          change_name=$(basename "$change_dir")
-          echo "Resolved OpenSpec change: ${change_name}"
-          echo "$change_name" > .change-name
-          echo ".change-name" >> .git/info/exclude
-          echo "SPEC_ID=${change_name}" >> "$GITHUB_ENV"
-
-      - name: Write the ticket to ticket.md
-        env:
-          CLICKUP_API_TOKEN: ${{ secrets.CLICKUP_API_TOKEN }}
-        run: |
-          set -euo pipefail
-
-          task_json="${RUNNER_TEMP}/task.json"
-
-          http_code=$(curl -sS -o "$task_json" -w '%{http_code}' \
-            -H "Authorization: ${CLICKUP_API_TOKEN}" \
-            "https://api.clickup.com/api/v2/task/${TICKET_ID}" || true)
-
-          if [ "$http_code" -lt 200 ] || [ "$http_code" -ge 300 ]; then
-            echo "::error::ClickUp GET task returned HTTP ${http_code}"
-            cat "$task_json"
-            {
-              echo "ClickUp GET task returned HTTP ${http_code}."
-              echo
-              cat "$task_json"
-            } > "${RUNNER_TEMP}/failure-reason.txt"
-            exit 1
-          fi
-
-          jq -r '.description // ""' "$task_json" > ticket.md
-          echo "ticket.md" >> .git/info/exclude
-
-          # For the run-record emit step's TICKET_TITLE — same task.json already
-          # fetched above, no new API call. Heredoc form (not a plain KEY=value
-          # line), same as agent-propose.yml's identical capture: a title can
-          # contain characters ($GITHUB_ENV's plain form can't handle safely.
-          {
-            echo "TICKET_TITLE<<TICKET_TITLE_EOF"
-            jq -r '.name // ""' "$task_json"
-            echo "TICKET_TITLE_EOF"
-          } >> "$GITHUB_ENV"
 
       - name: Trust the workspace for Claude Code
         run: |
@@ -254,169 +172,59 @@ jobs:
           claude plugin marketplace add https://github.com/obra/superpowers-marketplace
           claude plugin install superpowers@superpowers-marketplace
 
-      - name: Run the review agent
-        id: agent
-        env:
-          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-        run: |
-          set -euo pipefail
-
-          prompt="$(cat "${RUNNER_TEMP}/review-prompt.md")"
-          output_file="${RUNNER_TEMP}/claude-output.txt"
-          model="${CLAUDE_MODEL:-claude-sonnet-5}"
-          echo "Using model: ${model}"
-
-          claude_exit=0
-          claude -p "$prompt" \
-            --model "$model" \
-            --output-format json \
-            --allowed-tools "Read,Grep,Glob,Skill,Task,Bash(git diff:*),Bash(git log:*),Bash(git show:*)" \
-            > "$output_file" 2>&1 || claude_exit=$?
-
-          if [ "$claude_exit" -ne 0 ]; then
-            cat "$output_file"
-            echo "::error::claude exited with status ${claude_exit}"
-            {
-              echo "claude exited with status ${claude_exit}."
-              echo
-              tail -c 2000 "$output_file"
-            } > "${RUNNER_TEMP}/failure-reason.txt"
-
-            # Best-effort: capture whatever cost/session data IS available even on
-            # a failure — an API-level error (e.g. "credit balance too low")
-            # still returns a valid JSON result object with real cost already
-            # spent before erroring, confirmed on a real run ($1.33 spent, then
-            # failed). Losing that would be exactly the run a cost dashboard most
-            # needs to show. `|| true`: $output_file may not be valid JSON at all
-            # if claude crashed before producing any output.
-            jq -r '"CLAUDE_SESSION_ID=" + (.session_id // ""),
-                   "CLAUDE_MODEL_USED=" + ((.modelUsage // {}) | keys | last // ""),
-                   "CLAUDE_COST_USD=" + ((.total_cost_usd // "") | tostring),
-                   "CLAUDE_INPUT_TOKENS=" + ((.usage.input_tokens // "") | tostring),
-                   "CLAUDE_OUTPUT_TOKENS=" + ((.usage.output_tokens // "") | tostring),
-                   "CLAUDE_CACHE_READ_TOKENS=" + ((.usage.cache_read_input_tokens // "") | tostring),
-                   "CLAUDE_CACHE_CREATION_TOKENS=" + ((.usage.cache_creation_input_tokens // "") | tostring),
-                   "CLAUDE_NUM_TURNS=" + ((.num_turns // "") | tostring),
-                   "CLAUDE_DURATION_MS=" + ((.duration_ms // "") | tostring)' \
-              "$output_file" >> "$GITHUB_ENV" 2>/dev/null || true
-
-            exit "$claude_exit"
-          fi
-
-          # --output-format json means $output_file is now one JSON object, not the
-          # free-text stdout every RESULT:-grep downstream expects — extract .result
-          # (Claude's actual final text, identical in content to what plain text mode
-          # would have printed) before any of that existing parsing runs. See
-          # docs/dashboard-plan.md's Phase A2 for why: this also gets the cost/session
-          # data for the run-record emit step at no extra invocation cost.
-          result_text="${RUNNER_TEMP}/claude-result.txt"
-          jq -r '.result' "$output_file" > "$result_text"
-
-          echo "--- Claude's final result ---"
-          cat "$result_text"
-
-          jq -c '{session_id, model: ((.modelUsage // {}) | keys | last), cost_usd: .total_cost_usd,
-                  input_tokens: .usage.input_tokens, output_tokens: .usage.output_tokens,
-                  cache_read_tokens: .usage.cache_read_input_tokens,
-                  cache_creation_tokens: .usage.cache_creation_input_tokens,
-                  num_turns, duration_ms}' "$output_file" > "${RUNNER_TEMP}/claude-usage.json"
-
-          jq -r '"CLAUDE_SESSION_ID=" + (.session_id // ""),
-                 "CLAUDE_MODEL_USED=" + (.model // ""),
-                 "CLAUDE_COST_USD=" + ((.cost_usd // "") | tostring),
-                 "CLAUDE_INPUT_TOKENS=" + ((.input_tokens // "") | tostring),
-                 "CLAUDE_OUTPUT_TOKENS=" + ((.output_tokens // "") | tostring),
-                 "CLAUDE_CACHE_READ_TOKENS=" + ((.cache_read_tokens // "") | tostring),
-                 "CLAUDE_CACHE_CREATION_TOKENS=" + ((.cache_creation_tokens // "") | tostring),
-                 "CLAUDE_NUM_TURNS=" + ((.num_turns // "") | tostring),
-                 "CLAUDE_DURATION_MS=" + ((.duration_ms // "") | tostring)' \
-            "${RUNNER_TEMP}/claude-usage.json" >> "$GITHUB_ENV"
-
-          # `|| true`: grep exits 1 if RESULT: is missing, which would otherwise abort
-          # this line under the externally active `bash -e` before the check below ever
-          # runs — same class of bug already fixed elsewhere in this pipeline.
-          result=$(grep -m1 '^RESULT:' "$result_text" | sed 's/^RESULT: *//') || true
-
-          if [ "$result" != "reviewed" ]; then
-            echo "::error::claude's output has no RESULT: reviewed line"
-            {
-              echo "claude's output has no RESULT: reviewed line — cannot confirm the review completed."
-              echo
-              tail -c 2000 "$result_text"
-            } > "${RUNNER_TEMP}/failure-reason.txt"
-            exit 1
-          fi
-
-          # Review body = everything printed except the RESULT: line itself. `|| true`:
-          # grep -v exits 1 if every line matches (a degenerate all-RESULT: output),
-          # which would otherwise abort the script here under the externally active
-          # `bash -e` — same reasoning as the guard above.
-          grep -v '^RESULT:' "$result_text" > "${RUNNER_TEMP}/review-body.txt" || true
-
-      - name: Post the review to GitHub, then a short ClickUp pointer
+      - name: Run the review stage script
+        id: stage
         env:
           CLICKUP_API_TOKEN: ${{ secrets.CLICKUP_API_TOKEN }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           # DISPATCH_PAT, not GITHUB_TOKEN — same reasoning as every other gh pr call in
-          # this pipeline (see header comment: confirmed for gh pr create/gh pr ready on
-          # this fork; not independently reconfirmed for gh pr review, used regardless).
+          # this pipeline (confirmed for gh pr create/gh pr ready on this fork; not
+          # independently reconfirmed for gh pr review, used regardless).
           GH_TOKEN: ${{ secrets.DISPATCH_PAT }}
+          GH_REPO: ${{ github.repository }}
+          REVIEW_PROMPT_PATH: ${{ runner.temp }}/review-prompt.md
+          CLAUDE_MODEL: ${{ env.CLAUDE_MODEL }}
         run: |
           set -uo pipefail
 
-          run_step() {
-            local label="$1"
-            shift
-            local output code
-            output=$("$@" 2>&1) && code=0 || code=$?
-            if [ "$code" -ne 0 ]; then
-              echo "$output"
-              {
-                echo "${label} failed:"
-                echo
-                echo "$output"
-              } > "${RUNNER_TEMP}/failure-reason.txt"
-              exit "$code"
-            fi
-            echo "$output"
-          }
+          output_file="${RUNNER_TEMP}/stage-output.txt"
+          stage_exit=0
+          node scripts/stages/review.mjs "$TICKET_ID" > "$output_file" 2>&1 || stage_exit=$?
+          cat "$output_file"
 
-          run_step "gh pr review" gh pr review "poc/${TICKET_ID}" \
-            --comment \
-            --body-file "${RUNNER_TEMP}/review-body.txt" \
-            -R "${{ github.repository }}"
-
-          # `|| true` + explicit check, not a bare assignment: gh pr view failing here
-          # would otherwise abort the script under the externally active `bash -e`
-          # before the empty-value check below ever ran.
-          pr_url=$(gh pr view "poc/${TICKET_ID}" -R "${{ github.repository }}" --json url --jq '.url' || true)
-
-          if [ -z "$pr_url" ]; then
-            echo "::error::gh pr view returned no URL for poc/${TICKET_ID}"
-            echo "gh pr view returned no URL for poc/${TICKET_ID} — the review was posted, but the ClickUp pointer comment could not include a PR link." > "${RUNNER_TEMP}/failure-reason.txt"
-            exit 1
-          fi
-
-          comment_text=$(printf 'AI review posted.\n\nPR: %s' "$pr_url")
-          comment_payload=$(jq -n --arg t "$comment_text" '{comment_text: $t, notify_all: false}')
-          http_code=$(curl -sS -o "${RUNNER_TEMP}/comment-response.json" -w '%{http_code}' \
-            -X POST \
-            -H "Authorization: ${CLICKUP_API_TOKEN}" \
-            -H "Content-Type: application/json" \
-            "https://api.clickup.com/api/v2/task/${TICKET_ID}/comment" \
-            -d "$comment_payload" || true)
-
-          if [ "$http_code" -lt 200 ] || [ "$http_code" -ge 300 ]; then
-            echo "::error::ClickUp POST comment returned HTTP ${http_code}"
-            cat "${RUNNER_TEMP}/comment-response.json"
+          if [ -f "${RUNNER_TEMP}/ticket-meta.json" ]; then
             {
-              echo "ClickUp POST comment (review posted pointer) returned HTTP ${http_code}."
-              echo
-              cat "${RUNNER_TEMP}/comment-response.json"
-            } > "${RUNNER_TEMP}/failure-reason.txt"
-            exit 1
+              echo "TICKET_TITLE<<TICKET_TITLE_EOF"
+              jq -r '.title // ""' "${RUNNER_TEMP}/ticket-meta.json"
+              echo "TICKET_TITLE_EOF"
+            } >> "$GITHUB_ENV"
+          fi
+          if [ -f "${RUNNER_TEMP}/spec-id.txt" ]; then
+            echo "SPEC_ID=$(cat "${RUNNER_TEMP}/spec-id.txt")" >> "$GITHUB_ENV"
+          fi
+          if [ -f "${RUNNER_TEMP}/claude-usage.json" ]; then
+            jq -r '"CLAUDE_SESSION_ID=" + (.session_id // ""),
+                   "CLAUDE_MODEL_USED=" + (.model // ""),
+                   "CLAUDE_COST_USD=" + ((.cost_usd // "") | tostring),
+                   "CLAUDE_INPUT_TOKENS=" + ((.input_tokens // "") | tostring),
+                   "CLAUDE_OUTPUT_TOKENS=" + ((.output_tokens // "") | tostring),
+                   "CLAUDE_CACHE_READ_TOKENS=" + ((.cache_read_tokens // "") | tostring),
+                   "CLAUDE_CACHE_CREATION_TOKENS=" + ((.cache_creation_tokens // "") | tostring),
+                   "CLAUDE_NUM_TURNS=" + ((.num_turns // "") | tostring),
+                   "CLAUDE_DURATION_MS=" + ((.duration_ms // "") | tostring)' \
+              "${RUNNER_TEMP}/claude-usage.json" >> "$GITHUB_ENV" 2>/dev/null || true
           fi
 
-          echo "Ticket ${TICKET_ID}: review posted to ${pr_url}."
+          if [ "$stage_exit" -ne 0 ]; then
+            echo "::error::review stage script exited with status ${stage_exit}"
+            {
+              echo "review stage script exited with status ${stage_exit}."
+              echo
+              tail -c 2500 "$output_file"
+            } > "${RUNNER_TEMP}/failure-reason.txt"
+            exit "$stage_exit"
+          fi
+
           echo "OUTCOME=reviewed" >> "$GITHUB_ENV"
 
       - name: On failure after the lock, flag for a human

@@ -5,7 +5,7 @@
 // poc/<ticket_id> and does not itself handle branch checkout — that stays the workflow's
 // job for now. Not yet wired into agent-implement.yml (same deferred-wiring pattern as
 // Task 3's propose.mjs).
-import { getTask, putStatus, addTag, removeTag, postMarkdownComment } from '../lib/clickup.mjs';
+import { getTask, putStatus, addTag, postMarkdownComment } from '../lib/clickup.mjs';
 import { assertStatus } from '../lib/precondition.mjs';
 import { resolveChangeFromCli } from '../lib/openspec.mjs';
 import { runClaude } from '../lib/claude-runner.mjs';
@@ -39,32 +39,19 @@ async function excludeLocally(path) {
 }
 
 // --- Precondition -----------------------------------------------------------------
-// The original bash (agent-implement.yml:140-166) has NO status check before its own
-// lock PUT — it always writes "in progress" unconditionally, relying entirely on the
-// poller's own query filter for correctness. Per the spec, this script adds the check
-// pollers can't provide locally. Per the header comment (agent-implement.yml:15-23),
-// three dispatch kinds reach this script, each with a different valid starting status:
-//   - MODE=implement, no CI_FAILURE: a fresh dispatch from poll-clickup-implement.yml,
-//     ticket is at "ready for dev".
-//   - MODE=implement, CI_FAILURE set: a retry re-dispatched by agent-react-to-e2e.yml
-//     after the FIRST attempt already moved the ticket to "in progress" — so "in
-//     progress" is the correct starting point here, not a precondition violation.
-//   - MODE=apply-review: dispatched by agent-merge.yml after a human re-added for-ai at
-//     "in review" — ticket is at "in review".
+// Dispatch lock already happened via `node scripts/lock-ticket.mjs <ticket_id> "in
+// progress"`, called before the branch checkout — not here, for the same reason as
+// review.mjs: this script needs the right branch already checked out (for
+// resolveChangeFromCli and the self-check below), and the lock must happen before that
+// checkout can be allowed to fail. See scripts/lock-ticket.mjs's own header comment.
+//
+// Unlike review.mjs, there's only one post-lock status to check here, not one per
+// dispatch kind: the lock always PUTs "in progress" unconditionally — on a fresh
+// dispatch, a retry (where it's already there), or an apply-review dispatch alike —
+// matching the original bash's own lock step, which has no pre-check of its own either
+// (agent-implement.yml:140-166).
 const task = await getTask(ticketId);
-if (MODE === 'apply-review') {
-  assertStatus(task, 'in review');
-} else if (CI_FAILURE) {
-  assertStatus(task, 'in progress');
-} else {
-  assertStatus(task, 'ready for dev');
-}
-
-// --- Dispatch lock (idempotent on a retry, same as the original) -------------------
-await putStatus(ticketId, 'in progress');
-console.log(`Ticket ${ticketId}: moved to "in progress".`);
-const tagCode = await removeTag(ticketId, 'for-ai');
-console.log(`Ticket ${ticketId}: removed "for-ai" tag (HTTP ${tagCode}).`);
+assertStatus(task, 'in progress');
 
 // --- Mode-specific context ----------------------------------------------------------
 if (MODE === 'apply-review') {
@@ -102,7 +89,13 @@ writeFileSync('ticket.md', task.description ?? '');
 await excludeLocally('ticket.md');
 
 // --- Run the implement agent ---------------------------------------------------------
-const promptPath = MODE === 'apply-review' ? 'prompts/apply-review.md' : 'prompts/implement.md';
+// Overridable for the same reason as review.mjs's PROMPT_PATH: the ticket branch this
+// script runs against may predate this prompt file entirely (see
+// agent-implement.yml:189-218's "capture before the branch switch" step). A caller that
+// switches branches before invoking this script should capture the right prompt file
+// to a stable path first and set IMPLEMENT_PROMPT_PATH to it.
+const promptPath = process.env.IMPLEMENT_PROMPT_PATH
+  || (MODE === 'apply-review' ? 'prompts/apply-review.md' : 'prompts/implement.md');
 const agentResult = await runClaude({
   promptPath,
   allowedTools: ALLOWED_TOOLS,
