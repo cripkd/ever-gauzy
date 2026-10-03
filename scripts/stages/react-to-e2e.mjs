@@ -10,15 +10,17 @@
 // (exit 0), not errors — a propose-stage push producing a green e2e result, or a stale
 // superseded result, isn't this reactor's business to act on.
 import { getTask, putStatus, addTag, postPlainComment } from '../lib/clickup.mjs';
+import { bestEffort } from '../lib/best-effort.mjs';
 import { getPrReady } from '../lib/github.mjs';
 import { dispatchEvent } from '../lib/dispatch.mjs';
 import { classifyFailure } from '../lib/e2e-classify.mjs';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { existsSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 
 const execFileAsync = promisify(execFile);
-const RUNNER_TEMP = process.env.RUNNER_TEMP ?? '.';
+const RUNNER_TEMP = process.env.RUNNER_TEMP ?? tmpdir();
 
 const ticketId = process.argv[2];
 if (!ticketId) {
@@ -74,7 +76,9 @@ console.log('PROCEED=true');
 if (CONCLUSION === 'success') {
   await putStatus(ticketId, 'ready for review');
   await getPrReady(branch, GH_REPO);
-  await postPlainComment(ticketId, `e2e passed — PR marked ready for review.\n\nRun: ${RUN_URL}`);
+  // Best-effort, matching the original bash's `|| true` (agent-react-to-e2e.yml:219-224)
+  // — the status PUT and `gh pr ready` above already succeeded.
+  await bestEffort(() => postPlainComment(ticketId, `e2e passed — PR marked ready for review.\n\nRun: ${RUN_URL}`), 'ClickUp comment (e2e green)');
   console.log(`Ticket ${ticketId}: e2e green — moved to "ready for review", PR undrafted.`);
   console.log('OUTCOME=success');
   console.log('CLICKUP_STATUS_AFTER=ready for review');
@@ -92,7 +96,10 @@ if (CONCLUSION === 'failure') {
 
   if (count >= MAX_E2E_RETRIES) {
     await addTag(ticketId, 'needs-human');
-    await postPlainComment(ticketId, `e2e failed ${count} times — attempts exhausted, needs a human.\n\nRun: ${RUN_URL}`);
+    // Best-effort, matching the original bash's `|| true` (agent-react-to-e2e.yml:270-275)
+    // — if this throws, the OUTCOME/FAILURE_CLASS/CLICKUP_STATUS_AFTER markers below
+    // must still print; the workflow greps stdout for them.
+    await bestEffort(() => postPlainComment(ticketId, `e2e failed ${count} times — attempts exhausted, needs a human.\n\nRun: ${RUN_URL}`), 'ClickUp comment (retries exhausted)');
     console.log(`Ticket ${ticketId}: e2e retries exhausted (${count}/${MAX_E2E_RETRIES}) — tagged needs-human, status left at "in progress", not retrying.`);
     console.log('OUTCOME=failed');
     console.log('FAILURE_CLASS=retries-exhausted');

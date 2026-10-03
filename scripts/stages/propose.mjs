@@ -13,6 +13,8 @@ import { runClaude } from '../lib/claude-runner.mjs';
 import { writeFileSync, readFileSync, existsSync, readdirSync } from 'node:fs';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
+import { tmpdir } from 'node:os';
+import { excludeLocally } from '../lib/git-local.mjs';
 
 const execFileAsync = promisify(execFile);
 
@@ -23,7 +25,7 @@ if (!ticketId) {
 }
 
 const CLAUDE_MODEL = process.env.CLAUDE_MODEL || 'claude-sonnet-5';
-const RUNNER_TEMP = process.env.RUNNER_TEMP ?? '.';
+const RUNNER_TEMP = process.env.RUNNER_TEMP ?? tmpdir();
 const ALLOWED_TOOLS = 'Read,Write,Edit,Glob,Grep,Bash(openspec:*)';
 
 // This script assumes it runs AFTER the dispatch-lock status PUT (today's
@@ -32,7 +34,9 @@ const ALLOWED_TOOLS = 'Read,Write,Edit,Glob,Grep,Bash(openspec:*)';
 // "Run the propose agent" step.
 const task = await getTask(ticketId);
 assertStatus(task, 'spec proposed');
+writeFileSync(`${RUNNER_TEMP}/ticket-meta.json`, JSON.stringify({ title: task.name ?? '' }));
 writeFileSync('ticket.md', task.description ?? '');
+excludeLocally('ticket.md');
 
 // Overridable for the same reason as review.mjs/implement.mjs — lower risk here since
 // agent-propose.yml creates poc/<ticket_id> fresh from develop's current tip right
@@ -48,6 +52,13 @@ const proposeResult = await runClaude({
   cwd: '.',
 });
 console.log(proposeResult.resultText);
+// Only the propose call's own usage — not summed with the critique call below. The
+// original bash deliberately keeps the propose session's own CLAUDE_SESSION_ID/
+// CLAUDE_MODEL_USED even after summing cost/token totals across both calls
+// (agent-propose.yml:468-471: "the propose session is the more useful one to keep").
+// Full two-call cost summing is real additional logic, deferred to the propose-wiring
+// follow-up task rather than guessed at here for a script nothing calls yet.
+writeFileSync(`${RUNNER_TEMP}/claude-usage.json`, JSON.stringify(proposeResult.usage));
 
 const resultLine = /^RESULT: *(.+)$/m.exec(proposeResult.resultText);
 const result = resultLine?.[1]?.trim();
@@ -121,7 +132,19 @@ if (result === 'insufficient-detail') {
 
   console.log(`Ticket ${ticketId}: insufficient detail — reverted to "in spec", commented, no PR.`);
   console.log('OUTCOME=insufficient-detail');
+  console.log('FAILURE_CLASS=blocked-ambiguous');
+  console.log('CLICKUP_STATUS_AFTER=in spec');
   process.exit(0);
+}
+
+// Validate the proposal (agent-propose.yml:582-604) — only reached when result !=
+// 'insufficient-detail', matching the original's `if: steps.agent.outputs.result !=
+// 'insufficient-detail'`. --changes, not bare --strict: a bare `openspec validate
+// --strict` returns "Nothing to validate" with no target.
+try {
+  await execFileAsync('openspec', ['validate', '--changes', '--strict']);
+} catch (err) {
+  throw new Error(`openspec validate --changes --strict failed:\n\n${err.stdout ?? err.message}`);
 }
 
 console.log(`result=${result}`);

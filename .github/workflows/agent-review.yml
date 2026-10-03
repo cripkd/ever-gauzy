@@ -108,7 +108,7 @@ jobs:
         # scripts/lock-ticket.mjs's own header comment.
         env:
           CLICKUP_API_TOKEN: ${{ secrets.CLICKUP_API_TOKEN }}
-        run: node scripts/lock-ticket.mjs "$TICKET_ID" "in review"
+        run: node scripts/lock-ticket.mjs "$TICKET_ID" --expect "ready for review" --set "in review"
 
       - name: Capture the review prompt and record-run.mjs
         # Must happen BEFORE the branch switch below, and land outside the repo checkout

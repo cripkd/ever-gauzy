@@ -93,7 +93,7 @@ jobs:
         # whole run either way).
         env:
           CLICKUP_API_TOKEN: ${{ secrets.CLICKUP_API_TOKEN }}
-        run: node scripts/lock-ticket.mjs "$TICKET_ID"
+        run: node scripts/lock-ticket.mjs "$TICKET_ID" --expect "in review"
 
       - name: Capture the merge-triage prompt
         # Must happen BEFORE the branch switch below, and land outside the repo checkout

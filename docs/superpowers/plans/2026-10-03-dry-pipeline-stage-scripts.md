@@ -869,6 +869,7 @@ Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>"
 ## Explicitly deferred (not in this plan)
 
 - Porting `agent-propose.yml`'s branch-creation API dance (lines 142-240) and PR-opening (lines 606-674) into script form — Task 3 leaves these in the workflow. Separate follow-up once Tasks 1-7 above are reviewed.
+- **Wiring `agent-propose.yml` and `agent-implement.yml` to call `propose.mjs`/`implement.mjs` at all.** Both workflows remain byte-identical to the original bash (1,000+ lines of inline logic each) — the final review flagged this explicitly as something the plan's own Files lists should have named outright rather than leaving implicit. `propose.mjs`/`implement.mjs` exist, are unit/smoke-tested and code-reviewed, but nothing in CI or locally calls them yet; the two workflows run their own untouched bash exactly as before. Wiring both is the same follow-up as the branch-creation port above, not a separate one.
 - `.claude/commands/<stage>.md` slash-command wrappers for local convenience — the spec calls for these but they're pure sugar over `node scripts/stages/<stage>.mjs <ticket_id>`, which already works from any terminal. Add once the scripts themselves are reviewed and trusted.
 - Subagent definitions (`.claude/agents/*.md` replacing `--allowed-tools` flags) — independently useful, explicitly out of scope per the spec's "What does NOT change" section.
 - Actually running `git push`/opening a PR/merging against the real repo to exercise Tasks 3, 5, 6 end-to-end — deferred to the user's own supervised testing per this session's agreement.

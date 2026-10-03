@@ -16,9 +16,12 @@ import { dispatchEvent } from '../lib/dispatch.mjs';
 import { writeFileSync } from 'node:fs';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
+import { tmpdir } from 'node:os';
+import { excludeLocally } from '../lib/git-local.mjs';
+import { bestEffort } from '../lib/best-effort.mjs';
 
 const execFileAsync = promisify(execFile);
-const RUNNER_TEMP = process.env.RUNNER_TEMP ?? '.';
+const RUNNER_TEMP = process.env.RUNNER_TEMP ?? tmpdir();
 
 function writeState(state) {
   writeFileSync(`${RUNNER_TEMP}/merge-state.json`, JSON.stringify(state));
@@ -59,13 +62,20 @@ if (!body) {
   );
 }
 writeFileSync('.review-comments.md', `${body}\n`);
+excludeLocally('.review-comments.md');
 console.log(`Wrote .review-comments.md (${reviewsWithBody.length} review(s)).`);
 
 const specId = await resolveChangeFromCli();
 console.log(`Resolved OpenSpec change: ${specId}`);
 writeFileSync(`${RUNNER_TEMP}/spec-id.txt`, specId);
+// .change-name in the repo root, not just RUNNER_TEMP/spec-id.txt — prompts/merge-triage.md
+// instructs Claude to read it directly (same contract as prompts/review.md). The
+// RUNNER_TEMP copy is for the workflow's own SPEC_ID capture only.
+writeFileSync('.change-name', specId);
+excludeLocally('.change-name');
 
 writeFileSync('ticket.md', task.description ?? '');
+excludeLocally('ticket.md');
 
 const triageResult = await runClaude({
   promptPath: MERGE_TRIAGE_PROMPT_PATH,
@@ -90,7 +100,9 @@ if (result === 'needs-changes') {
   if (count >= MAX_APPLY_REVIEW_ROUNDS) {
     await addTag(ticketId, 'needs-human');
     const commentText = `Merge triage still found actionable review feedback after ${count} apply-review round(s) (cap: ${MAX_APPLY_REVIEW_ROUNDS}) — stopping instead of looping. Reasoning below.\n\n${triageResult.resultText.slice(0, 3000)}`;
-    await postMarkdownComment(ticketId, commentText);
+    // Best-effort, matching the original bash's `|| true` (agent-merge.yml:344-353) —
+    // the needs-human tag above already landed; losing this comment must not mask that.
+    await bestEffort(() => postMarkdownComment(ticketId, commentText), 'ClickUp comment (rounds exhausted)');
     console.log(`Ticket ${ticketId}: apply-review rounds exhausted (${count}/${MAX_APPLY_REVIEW_ROUNDS}) — tagged needs-human, not dispatching again.`);
     writeState({ outcome: 'failed', failureClass: 'apply-review-rounds-exhausted', statusAfter: 'in review' });
     process.exit(0);
@@ -129,7 +141,10 @@ if (result === 'ready-to-merge') {
   await putStatus(ticketId, 'ready for deploy');
 
   const commentText = `Archived OpenSpec change \`${specId}\` and merged the PR into develop.\n\n${prUrl}`;
-  await postMarkdownComment(ticketId, commentText);
+  // Best-effort, matching the original bash's `|| true` (agent-merge.yml:457-462) —
+  // the merge and status update above already succeeded; a ClickUp hiccup here must
+  // not make a successfully merged ticket report OUTCOME=failed.
+  await bestEffort(() => postMarkdownComment(ticketId, commentText), 'ClickUp comment (merged)');
 
   console.log(`Ticket ${ticketId}: archived and merged — moved to "ready for deploy".`);
   writeState({ outcome: 'merged', statusAfter: 'ready for deploy', commitSha: commitSha.trim() });

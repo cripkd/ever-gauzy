@@ -41,7 +41,7 @@ export async function runSelfCheck(pairs, projects, { defaultBranch = 'develop',
     await execFileAsync(
       'node',
       ['--max-old-space-size=8192', './node_modules/nx/bin/nx.js', 'run-many', '--target=typecheck,build', `--projects=${projectsCsv}`],
-      { maxBuffer: 1024 * 1024 * 50 }
+      { maxBuffer: 1024 * 1024 * 500 }
     );
   } catch (err) {
     outputLines.push('::warning::self-check build/typecheck failed — retrying once (nx cache skips finished deps)');
@@ -50,7 +50,7 @@ export async function runSelfCheck(pairs, projects, { defaultBranch = 'develop',
       await execFileAsync(
         'node',
         ['--max-old-space-size=8192', './node_modules/nx/bin/nx.js', 'run-many', '--target=typecheck,build', `--projects=${projectsCsv}`],
-        { maxBuffer: 1024 * 1024 * 50 }
+        { maxBuffer: 1024 * 1024 * 500 }
       );
     } catch (err2) {
       buildExit = err2.code ?? 1;
@@ -80,7 +80,7 @@ export async function runSelfCheck(pairs, projects, { defaultBranch = 'develop',
 
     const lintArgs = ['nx', 'run', `${project}:lint`, ...files.map((f) => `--lintFilePatterns=${f}`)];
     try {
-      await execFileAsync('npx', lintArgs, { maxBuffer: 1024 * 1024 * 50 });
+      await execFileAsync('npx', lintArgs, { maxBuffer: 1024 * 1024 * 500 });
     } catch (err) {
       lintExit = err.code ?? 1;
       outputLines.push(err.stdout ?? '', err.stderr ?? '');

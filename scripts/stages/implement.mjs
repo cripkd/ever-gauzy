@@ -10,11 +10,15 @@ import { assertStatus } from '../lib/precondition.mjs';
 import { resolveChangeFromCli } from '../lib/openspec.mjs';
 import { runClaude } from '../lib/claude-runner.mjs';
 import { resolveChangedProjects, runSelfCheck } from '../lib/self-check.mjs';
-import { writeFileSync, readFileSync, appendFileSync } from 'node:fs';
+import { excludeLocally } from '../lib/git-local.mjs';
+import { bestEffort } from '../lib/best-effort.mjs';
+import { writeFileSync, readFileSync } from 'node:fs';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
+import { tmpdir } from 'node:os';
 
 const execFileAsync = promisify(execFile);
+const RUNNER_TEMP = process.env.RUNNER_TEMP ?? tmpdir();
 
 const ticketId = process.argv[2];
 if (!ticketId) {
@@ -34,8 +38,11 @@ async function gitStatusPorcelain() {
   return stdout;
 }
 
-async function excludeLocally(path) {
-  appendFileSync('.git/info/exclude', `${path}\n`);
+// Structured outcome state for the eventual workflow wiring to read — same pattern as
+// merge.mjs's writeState, needed here for the same reason: four distinct outcome shapes
+// (blocked / self-check-failed / apply-review no-op / implemented), not one.
+function writeState(state) {
+  writeFileSync(`${RUNNER_TEMP}/implement-state.json`, JSON.stringify(state));
 }
 
 // --- Precondition -----------------------------------------------------------------
@@ -52,6 +59,7 @@ async function excludeLocally(path) {
 // (agent-implement.yml:140-166).
 const task = await getTask(ticketId);
 assertStatus(task, 'in progress');
+writeFileSync(`${RUNNER_TEMP}/ticket-meta.json`, JSON.stringify({ title: task.name ?? '' }));
 
 // --- Mode-specific context ----------------------------------------------------------
 if (MODE === 'apply-review') {
@@ -103,6 +111,7 @@ const agentResult = await runClaude({
   cwd: '.',
 });
 console.log(agentResult.resultText);
+writeFileSync(`${RUNNER_TEMP}/claude-usage.json`, JSON.stringify(agentResult.usage));
 
 const resultMatch = /^RESULT: *(.+)$/m.exec(agentResult.resultText);
 const result = resultMatch?.[1]?.trim();
@@ -142,14 +151,24 @@ if (result === 'blocked') {
   await postMarkdownComment(ticketId, commentText);
 
   console.log(`Ticket ${ticketId}: ${actionDesc.toLowerCase()} blocked — reverted to "${revertStatus}", tagged, commented.`);
-  console.log('OUTCOME=blocked');
+  writeState({ outcome: 'blocked', failureClass: 'blocked-ambiguous', statusAfter: revertStatus });
   process.exit(0);
 }
 
 // --- RESULT: implemented --------------------------------------------------------------
 if (result === 'implemented') {
-  const { stdout: defaultBranchRef } = await execFileAsync('git', ['symbolic-ref', 'refs/remotes/origin/HEAD']);
-  const defaultBranch = defaultBranchRef.trim().replace('refs/remotes/origin/', '');
+  // Prefer an explicit env var — the same source the original bash used
+  // (github.event.repository.default_branch) — over `git symbolic-ref
+  // refs/remotes/origin/HEAD`: actions/checkout builds the repo via `git init` + `git
+  // fetch`, not a full clone, so that ref is often simply absent on a real runner (it's
+  // only reliably present after a `git clone`, which is why this passed when verified
+  // against a local clone but would fail in CI). The symbolic-ref lookup stays as a
+  // fallback for a plain local clone where DEFAULT_BRANCH isn't set.
+  let defaultBranch = process.env.DEFAULT_BRANCH;
+  if (!defaultBranch) {
+    const { stdout: defaultBranchRef } = await execFileAsync('git', ['symbolic-ref', 'refs/remotes/origin/HEAD']);
+    defaultBranch = defaultBranchRef.trim().replace('refs/remotes/origin/', '');
+  }
   const { stdout: baseSha } = await execFileAsync('git', ['merge-base', `origin/${defaultBranch}`, 'HEAD']);
   const { stdout: diffOut } = await execFileAsync('git', ['diff', '--name-only', baseSha.trim(), 'HEAD']);
   const changedFiles = diffOut.split('\n').filter((f) => f.length > 0);
@@ -168,8 +187,10 @@ if (result === 'implemented') {
       await execFileAsync('git', ['commit', '-m', `WIP: ${ticketId} — implementation complete but self-check failed, left for inspection`]);
       await execFileAsync('git', ['push', 'origin', `poc/${ticketId}`]);
     }
-    console.log('OUTCOME=self-check-failed');
-    console.log(`FAILURE_CLASS=${selfCheck.failureClass}`);
+    // Status is never reverted on this path (unlike "blocked") — stays whatever the
+    // lock set ("in progress"): the agent believed it was done and wasn't, treated as
+    // a real failure, not undone. Matches agent-implement.yml:861-866.
+    writeState({ outcome: 'self-check-failed', failureClass: selfCheck.failureClass, statusAfter: 'in progress' });
     process.exit(1);
   }
 
@@ -181,9 +202,11 @@ if (result === 'implemented') {
   if (MODE === 'apply-review' && porcelainAfterCheck.trim() === '') {
     await putStatus(ticketId, 'ready for review');
     const commentText = `Review feedback required no code changes — PR unchanged, back to "ready for review".\n\n${agentResult.resultText.slice(0, 3000)}`;
-    await postMarkdownComment(ticketId, commentText);
+    // Best-effort, matching the original bash's `|| true` (agent-implement.yml:938-947)
+    // — the status PUT above already succeeded.
+    await bestEffort(() => postMarkdownComment(ticketId, commentText), 'ClickUp comment (apply-review no-op)');
     console.log(`Ticket ${ticketId}: apply-review made no changes — moved straight back to "ready for review".`);
-    console.log('OUTCOME=implemented');
+    writeState({ outcome: 'implemented', statusAfter: 'ready for review' });
     process.exit(0);
   }
 
@@ -202,9 +225,12 @@ if (result === 'implemented') {
   await execFileAsync('git', ['add', '-A']);
   await execFileAsync('git', ['commit', '-m', commitMessage]);
   await execFileAsync('git', ['push', 'origin', `poc/${ticketId}`]);
+  const { stdout: commitSha } = await execFileAsync('git', ['rev-parse', 'HEAD']);
 
   console.log(`Ticket ${ticketId}: pushed. PR stays in draft until agent-react-to-e2e.yml confirms a green e2e run.`);
-  console.log('OUTCOME=implemented');
+  // COMMIT_SHA is load-bearing for the dashboard (agent-implement.yml:980-985) — it's
+  // how a later e2e run against this exact commit gets joined back to this record.
+  writeState({ outcome: 'implemented', statusAfter: 'in progress', commitSha: commitSha.trim() });
   process.exit(0);
 }
 

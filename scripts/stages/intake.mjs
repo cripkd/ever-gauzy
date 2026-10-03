@@ -3,6 +3,7 @@
 import { writeFileSync, mkdirSync, readFileSync, cpSync, existsSync } from 'node:fs';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
+import { tmpdir } from 'node:os';
 import { getTask, putStatus, removeTag, putCustomField, putDescriptionMarkdown } from '../lib/clickup.mjs';
 import { assertStatus } from '../lib/precondition.mjs';
 
@@ -18,7 +19,7 @@ const ORIGINAL_REPORT_FIELD_ID = process.env.ORIGINAL_REPORT_FIELD_ID;
 const BUG_CUSTOM_ITEM_ID = process.env.BUG_CUSTOM_ITEM_ID;
 const IN_SPEC_STATUS = process.env.IN_SPEC_STATUS || 'in spec';
 const CLAUDE_MODEL = process.env.CLAUDE_MODEL || 'claude-sonnet-5';
-const RUNNER_TEMP = process.env.RUNNER_TEMP ?? '.';
+const RUNNER_TEMP = process.env.RUNNER_TEMP ?? tmpdir();
 
 const task = await getTask(ticketId);
 

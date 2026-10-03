@@ -5,7 +5,9 @@ import { assertStatus } from '../lib/precondition.mjs';
 import { resolveChangeFromDirectoryListing } from '../lib/openspec.mjs';
 import { runClaude } from '../lib/claude-runner.mjs';
 import { postPrReview, getPrUrl } from '../lib/github.mjs';
+import { excludeLocally } from '../lib/git-local.mjs';
 import { writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 
 const ticketId = process.argv[2];
 if (!ticketId) {
@@ -14,7 +16,7 @@ if (!ticketId) {
 }
 
 const CLAUDE_MODEL = process.env.CLAUDE_MODEL || 'claude-sonnet-5';
-const RUNNER_TEMP = process.env.RUNNER_TEMP ?? '.';
+const RUNNER_TEMP = process.env.RUNNER_TEMP ?? tmpdir();
 const GH_REPO = process.env.GH_REPO;
 const ALLOWED_TOOLS = 'Read,Grep,Glob,Skill,Task,Bash(git diff:*),Bash(git log:*),Bash(git show:*)';
 // Overridable: the ticket branch this script runs against may be older than the
@@ -48,8 +50,14 @@ writeFileSync(`${RUNNER_TEMP}/ticket-meta.json`, JSON.stringify({ title: task.na
 const specId = resolveChangeFromDirectoryListing();
 console.log(`Resolved OpenSpec change: ${specId}`);
 writeFileSync(`${RUNNER_TEMP}/spec-id.txt`, specId);
+// .change-name in the repo root: prompts/review.md instructs Claude to read it directly
+// ("Change id: `.change-name` in the repo root") — the RUNNER_TEMP copy above is only
+// for the workflow's own SPEC_ID capture, not for the agent.
+writeFileSync('.change-name', specId);
+excludeLocally('.change-name');
 
 writeFileSync('ticket.md', task.description ?? '');
+excludeLocally('ticket.md');
 
 const reviewResult = await runClaude({
   promptPath: PROMPT_PATH,
