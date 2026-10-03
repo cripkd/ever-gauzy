@@ -21,3 +21,7 @@ export async function getPrReviews(branch, repo) {
 export async function mergePr(branch, repo) {
   await execFileAsync('gh', ['pr', 'merge', branch, '--merge', '--delete-branch', '-R', repo]);
 }
+
+export async function getPrReady(branch, repo) {
+  await execFileAsync('gh', ['pr', 'ready', branch, '-R', repo]);
+}
