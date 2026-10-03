@@ -62,6 +62,40 @@ Run-record emission (the dashboard artifact) stays conditional on
 upload that don't exist for a local invocation. Local runs skip it
 rather than emit a record with no meaningful run URL.
 
+## Local ticket discovery and branch handling
+
+Pollers are out of scope (see above), so a human doesn't "discover"
+eligible tickets locally — they already have one ticket in mind and
+invoke the stage command that matches its current ClickUp status
+directly. This removes the only safety net that exists today: the
+poller's own query filter (e.g. `poll-clickup-review.yml` only ever
+queries `ready for review`) is the sole thing preventing a stage from
+running against a ticket in the wrong status — the agent workflow
+itself never re-checks. To not lose that guarantee for the local path,
+**each stage script re-verifies the ticket's current status matches
+what that stage expects before mutating anything**, failing loudly if
+not. This is a deliberate addition beyond today's GH-Actions-only
+behavior, not a straight port of it — necessary because local
+invocation has no poller guarding it.
+
+Branch checkout (fetch `poc/<ticket_id>`, `git checkout -B`) becomes a
+second shared helper, `scripts/checkout-ticket.mjs <ticket_id>`,
+extracted the same way as the stage scripts. GH Actions keeps
+`actions/checkout@v5` (still needed to get the repo onto the runner at
+all) and calls this script in place of its inline fetch/checkout-B
+bash. Locally, the human runs the same script (or a
+`.claude/commands/checkout-ticket.md` wrapper) directly.
+
+Kept as its own explicit step, not auto-run inside every stage script:
+GH Actions can switch branches freely because every run starts from a
+disposable checkout; a human's long-lived local clone can't make that
+assumption — a stage script silently switching branches could step on
+uncommitted work. Explicit means the human chooses when the switch
+happens. Not relevant to the pilot stage itself: intake operates
+straight on `develop` against an isolated scratch dir and never checks
+out a ticket branch; this matters starting at propose, which
+originates `poc/<ticket_id>`.
+
 ## What does NOT change in this round
 
 - Subagent definitions (`.claude/agents/*.md` replacing `--allowed-tools`
